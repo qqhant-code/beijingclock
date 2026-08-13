@@ -85,6 +85,7 @@ struct ContentView: View {
             FloatingClockManager.shared.updateTime()
         }
         .onReceive(NotificationCenter.default.publisher(for: FloatingClockManager.pipStateNotification)) { _ in
+            running = FloatingClockManager.shared.isRunning
             floating = FloatingClockManager.shared.floating
             lastError = FloatingClockManager.shared.lastError
         }

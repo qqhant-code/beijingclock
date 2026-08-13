@@ -34,8 +34,10 @@ final class FloatingClockWindow: UIWindow {
 
     init(scene: UIWindowScene) {
         super.init(windowScene: scene)
-        // 高于状态栏(2000)，低于系统 alert，保证盖在所有普通 App 之上
-        self.windowLevel = UIWindow.Level(rawValue: UIWindow.Level.statusBar.rawValue + 1)
+        // 高于状态栏，低于系统 alert，保证盖在所有普通 App 之上。
+        // 用硬编码安全值避免依赖已废弃的 UIWindow.Level.statusBar。
+        self.windowLevel = UIWindow.Level(rawValue: 2001)
+        self.frame = scene.screen.bounds
         self.backgroundColor = .clear
         self.isHidden = true
         setupRoot()

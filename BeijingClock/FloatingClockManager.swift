@@ -6,7 +6,7 @@ import UIKit
 ///
 /// 原理：
 /// 1. 自建一个高 windowLevel 的 UIWindow（FloatingClockWindow），盖在所有 App 之上；
-/// 2. 后台静音音频保活（`UIBackgroundModes: audio` + 循环静音 AVAudioEngine），
+/// 2. 后台静音音频保活（`UIBackgroundModes: audio` + 循环静音 AVAudioPlayer），
 ///    App 退到后台不被挂起，悬浮窗持续跳秒；
 /// 3. `Timer` 每 0.1 秒刷新一次北京时间（来自网络授时 TimeSync，不受系统时间影响）。
 final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
@@ -16,8 +16,7 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
     /// 状态变化通知（供 UI 显示）
     static let pipStateNotification = Notification.Name("BeijingClockStateChanged")
 
-    private let audioEngine = AVAudioEngine()
-    private let playerNode = AVAudioPlayerNode()
+    private var silentPlayer: AVAudioPlayer?
     private let locationManager = CLLocationManager()
     private var locationKeepAlive = false
 
@@ -114,6 +113,8 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
 
     // MARK: - 静音后台音频保活
 
+    /// 用 AVAudioPlayer 循环播放内存中的静音 WAV。
+    /// 比 AVAudioEngine 稳得多，且只要 .playback 后台模式开启即可保活。
     private func startSilentAudio() {
         do {
             let sess = AVAudioSession.sharedInstance()
@@ -124,30 +125,54 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
             print("audio session: \(error)")
         }
 
-        let mixer = audioEngine.mainMixerNode
-        let fmt = mixer.outputFormat(forBus: 0)
-        guard fmt.commonFormat == .pcmFormatFloat32 || fmt.commonFormat == .pcmFormatInt16 else {
-            print("audio mixer format 不是 PCM，放弃静音保活")
+        guard let data = Self.makeSilentWav() else {
+            print("生成静音 WAV 失败，放弃音频保活（悬浮窗仍会显示）")
             return
         }
-        audioEngine.attach(playerNode)
-        audioEngine.connect(playerNode, to: mixer, format: fmt)
-        // 全 0 缓冲区 = 静音，循环播放以保活后台
-        guard let buf = AVAudioPCMBuffer(pcmFormat: fmt,
-                                        frameCapacity: AVAudioFrameCount(fmt.sampleRate)) else { return }
-        playerNode.scheduleBuffer(buf, at: nil, options: .loops)
         do {
-            try audioEngine.start()
-            playerNode.play()
+            let player = try AVAudioPlayer(data: data)
+            player.numberOfLoops = -1   // 无限循环
+            player.volume = 0
+            player.play()
+            silentPlayer = player
         } catch {
-            print("audio engine: \(error)")
+            print("audio player: \(error)")
         }
     }
 
     private func stopSilentAudio() {
-        playerNode.stop()
-        audioEngine.stop()
+        silentPlayer?.stop()
+        silentPlayer = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    /// 生成一段极短的静音 16-bit PCM WAV（约 0.1 秒），避免打包外部音频文件。
+    private static func makeSilentWav() -> Data? {
+        let sampleRate: UInt32 = 8000
+        let numChannels: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let numSamples: UInt32 = sampleRate / 10
+        let blockAlign = numChannels * (bitsPerSample / 8)
+        let byteRate = sampleRate * UInt32(blockAlign)
+        let dataSize = numSamples * UInt32(blockAlign)
+        let chunkSize = 36 + dataSize
+
+        var d = Data()
+        d.append(contentsOf: [0x52, 0x49, 0x46, 0x46])          // "RIFF"
+        d.append(withUnsafeBytes(of: chunkSize.littleEndian) { Data($0) })
+        d.append(contentsOf: [0x57, 0x41, 0x56, 0x45])          // "WAVE"
+        d.append(contentsOf: [0x66, 0x6D, 0x74, 0x20])          // "fmt "
+        d.append(withUnsafeBytes(of: UInt32(16).littleEndian) { Data($0) })
+        d.append(withUnsafeBytes(of: UInt16(1).littleEndian) { Data($0) })   // PCM
+        d.append(withUnsafeBytes(of: numChannels.littleEndian) { Data($0) })
+        d.append(withUnsafeBytes(of: sampleRate.littleEndian) { Data($0) })
+        d.append(withUnsafeBytes(of: byteRate.littleEndian) { Data($0) })
+        d.append(withUnsafeBytes(of: blockAlign.littleEndian) { Data($0) })
+        d.append(withUnsafeBytes(of: bitsPerSample.littleEndian) { Data($0) })
+        d.append(contentsOf: [0x64, 0x61, 0x74, 0x61])          // "data"
+        d.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
+        d.append(Data(count: Int(dataSize)))                     // 全 0 = 静音
+        return d
     }
 
     // MARK: - 定位保活（可选增强，与 zk助手一致：audio + location 双保活）
