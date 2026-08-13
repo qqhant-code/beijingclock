@@ -93,7 +93,7 @@ final class FloatingClockManager: NSObject {
     /// 手动重试启动 PiP（供 UI 按钮调用）
     func retryStartPiP() {
         guard running else {
-            pipError = "请先点击"开启悬浮时钟""
+            pipError = "请先点击「开启悬浮时钟」"
             postState()
             return
         }
@@ -182,7 +182,7 @@ final class FloatingClockManager: NSObject {
                 self?.tryStartPiP()
             }
         } else {
-            pipError = "自动启动失败，请点"重试悬浮窗""
+            pipError = "自动启动失败，请点「重试悬浮窗」"
             postState()
         }
     }
