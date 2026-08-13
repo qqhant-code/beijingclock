@@ -9,11 +9,12 @@ struct ContentView: View {
     @State private var lastSync = ""
     @State private var pipActive = false
     @State private var pipError: String?
+    @State private var retryCount = 0
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VStack(spacing: 22) {
+            VStack(spacing: 20) {
                 Text("北京时间 · 悬浮时钟")
                     .foregroundColor(.gray)
                     .font(.title3)
@@ -39,12 +40,26 @@ struct ContentView: View {
                 }
 
                 // 悬浮窗状态（诊断用）
-                HStack(spacing: 6) {
-                    Image(systemName: "airplayvideo")
-                        .foregroundColor(pipActive ? .green : (pipError == nil ? .gray : .red))
-                    Text(pipActive ? "悬浮窗运行中" : (pipError == nil ? "悬浮窗未启动" : "悬浮窗启动失败"))
-                        .foregroundColor(pipError == nil ? .gray : .red)
-                        .font(.caption)
+                VStack(spacing: 4) {
+                    HStack(spacing: 6) {
+                        Image(systemName: pipActive ? "pip.fill" : "pip")
+                            .foregroundColor(pipActive ? .green : (pipError == nil ? .gray : .red))
+                        Text(pipActive ? "悬浮窗运行中" : (pipError == nil ? "悬浮窗未启动" : "悬浮窗启动失败"))
+                            .foregroundColor(pipError == nil ? .gray : .red)
+                            .font(.caption)
+                    }
+                    if let err = pipError {
+                        Text(err)
+                            .font(.caption2)
+                            .foregroundColor(.red)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 30)
+                    }
+                    if retryCount > 0 && !pipActive && pipError == nil {
+                        Text("正在尝试启动…(\(retryCount))")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    }
                 }
 
                 Button(action: toggle) {
@@ -56,6 +71,12 @@ struct ContentView: View {
                 }
 
                 if running {
+                    Button("重试启动悬浮窗") {
+                        FloatingClockManager.shared.retryStartPiP()
+                    }
+                    .foregroundColor(.orange)
+                    .font(.caption)
+
                     Button("画面翻转（若字倒着点这里）") {
                         ClockFrameRenderer.flipVertical.toggle()
                         FloatingClockManager.shared.enqueueFrame()
@@ -72,6 +93,7 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: FloatingClockManager.pipStateNotification)) { _ in
             pipActive = FloatingClockManager.shared.pipActive
             pipError = FloatingClockManager.shared.pipError
+            retryCount = FloatingClockManager.shared.retryCount
         }
     }
 

@@ -62,6 +62,18 @@ enum TimeSync {
         return f.string(from: date)
     }
 
+    /// 格式化为 "HH:mm:ss.S"（带 0.1 秒），更适合悬浮窗细长条显示。
+    static func formatBeijingPrecise(_ date: Date) -> String {
+        let cal = Calendar(identifier: .gregorian)
+        var comp = cal.dateComponents(in: TimeZone(secondsFromGMT: 8 * 3600)!, from: date)
+        let h = comp.hour ?? 0
+        let m = comp.minute ?? 0
+        let s = comp.second ?? 0
+        // 取十分秒(0~9)
+        let ms = Int((date.timeIntervalSince1970.truncatingRemainder(dividingBy: 1)) * 10)
+        return String(format: "%02d:%02d:%02d.%d", h, m, s, ms)
+    }
+
     // MARK: - 私有
 
     private static func parseRFC1123(_ s: String) -> Date? {
