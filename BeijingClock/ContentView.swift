@@ -2,6 +2,14 @@ import Combine
 import SwiftUI
 import UIKit
 
+/// 把 AVSampleBufferDisplayLayer 包装进 SwiftUI，作为内联预览 + PiP 源。
+struct SampleBufferDisplayViewRepresentable: UIViewRepresentable {
+    let sampleView: SampleBufferDisplayView
+
+    func makeUIView(context: Context) -> SampleBufferDisplayView { sampleView }
+    func updateUIView(_ uiView: SampleBufferDisplayView, context: Context) {}
+}
+
 struct ContentView: View {
 
     @State private var running = false
@@ -38,6 +46,13 @@ struct ContentView: View {
                         Text("· \(lastSync)").foregroundColor(.gray).font(.caption)
                     }
                 }
+
+                // 内联预览层（也是 PiP 源，必须可见 PiP 才能起来）
+                SampleBufferDisplayViewRepresentable(sampleView: FloatingClockManager.shared.sampleView)
+                    .frame(width: 220, height: 37)
+                    .background(Color.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .padding(.vertical, 6)
 
                 // 悬浮窗状态（诊断用）
                 VStack(spacing: 4) {
@@ -89,7 +104,10 @@ struct ContentView: View {
                     .foregroundColor(.cyan)
             }
         }
-        .onAppear { resync() }
+        .onAppear {
+            resync()
+            FloatingClockManager.shared.startPreview()
+        }
         .onReceive(NotificationCenter.default.publisher(for: FloatingClockManager.pipStateNotification)) { _ in
             pipActive = FloatingClockManager.shared.pipActive
             pipError = FloatingClockManager.shared.pipError

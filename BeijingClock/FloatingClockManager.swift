@@ -21,7 +21,14 @@ final class FloatingClockManager: NSObject {
 
     private var pipController: AVPictureInPictureController?
     private var pumpTimer: Timer?
-    private var sampleView: SampleBufferDisplayView?
+    private var previewTimer: Timer?
+    /// 内联预览视图，同时也是 PiP 源。由 ContentView 通过 UIViewRepresentable 挂载到界面。
+    private(set) lazy var sampleView: SampleBufferDisplayView = {
+        let size = ClockFrameRenderer.frameSize
+        let v = SampleBufferDisplayView(frame: CGRect(origin: .zero, size: size))
+        v.isUserInteractionEnabled = false
+        return v
+    }()
     private let audioEngine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private var resyncTimer: Timer?
@@ -50,7 +57,6 @@ final class FloatingClockManager: NSObject {
         }
 
         startSilentAudio()
-        setupSampleView()
         setupPiP()
         running = true
         retryCount = 0
@@ -58,12 +64,14 @@ final class FloatingClockManager: NSObject {
         postState()
 
         // 先推一帧（PiP 需要内联层已有可渲染内容）
+        stopPreview()
         enqueueFrame()
         startPump()
 
-        // 立刻尝试启动 PiP；失败后自动重试。
-        // 很多设备上 isPictureInPicturePossible 要过几帧才变 true，所以必须轮询。
-        tryStartPiP()
+        // 给 inline 预览层一点时间渲染，再启动 PiP
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.tryStartPiP()
+        }
 
         // 每 5 分钟重新校时一次，修正漂移
         resyncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
@@ -81,8 +89,7 @@ final class FloatingClockManager: NSObject {
         stopSilentAudio()
         resyncTimer?.invalidate()
         resyncTimer = nil
-        sampleView?.removeFromSuperview()
-        sampleView = nil
+        // sampleView 由 ContentView 的 UIViewRepresentable 托管，不在这里移除/nil
         pipController = nil
         running = false
         pipActive = false
@@ -104,46 +111,13 @@ final class FloatingClockManager: NSObject {
     }
 
     // MARK: - 内联预览视图（也是 PiP 源）
-
-    private func setupSampleView() {
-        let size = ClockFrameRenderer.frameSize
-        let v = SampleBufferDisplayView(frame: CGRect(x: 0, y: 0, width: size.width, height: size.height))
-        v.isUserInteractionEnabled = false
-        sampleView = v
-        attachToWindow(v)
-    }
-
-    private func attachToWindow(_ v: UIView) {
-        guard v.superview == nil else { return }
-        guard let window = keyWindow ?? firstWindow else {
-            print("找不到可用 window，无法挂载内联层")
-            return
-        }
-        window.addSubview(v)
-        // 把内联层放到屏幕外，避免遮挡 App 主界面内容
-        v.frame = CGRect(x: -2000,
-                         y: 0,
-                         width: ClockFrameRenderer.frameSize.width,
-                         height: ClockFrameRenderer.frameSize.height)
-        window.layoutIfNeeded()
-    }
-
-    private var keyWindow: UIWindow? {
-        (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
-            .windows.first(where: { $0.isKeyWindow })
-    }
-
-    private var firstWindow: UIWindow? {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap { $0.windows }
-            .first
-    }
+    // sampleView 由 ContentView 通过 UIViewRepresentable 托管并显示在界面内，
+    // 这是 PiP 能成功启动的关键：layer 必须在可见的 view hierarchy 里。
 
     // MARK: - PiP
 
     private func setupPiP() {
-        guard let layer = sampleView?.sampleBufferLayer else { return }
+        let layer = sampleView.sampleBufferLayer
         layer.videoGravity = .resizeAspect
         let source = AVPictureInPictureController.ContentSource(
             sampleBufferDisplayLayer: layer,
@@ -201,8 +175,21 @@ final class FloatingClockManager: NSObject {
         pumpTimer = nil
     }
 
+    /// App 内联预览的慢速推帧（1 秒 1 帧），不占用太多 CPU。
+    func startPreview() {
+        guard previewTimer == nil else { return }
+        previewTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.enqueueFrame()
+        }
+    }
+
+    private func stopPreview() {
+        previewTimer?.invalidate()
+        previewTimer = nil
+    }
+
     func enqueueFrame() {
-        guard let layer = sampleView?.sampleBufferLayer else { return }
+        let layer = sampleView.sampleBufferLayer
         let now = Date().addingTimeInterval(offset)
         if let sbuf = ClockFrameRenderer.makeSampleBuffer(text: TimeSync.formatBeijingPrecise(now)) {
             layer.enqueue(sbuf)
