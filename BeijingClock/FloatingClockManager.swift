@@ -43,7 +43,9 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         guard !running else { return }
         guard FloatingClockWindow.shared == nil else {
             FloatingClockWindow.shared?.showFloating()
+            running = true
             floating = true
+            lastError = nil
             postState()
             return
         }
