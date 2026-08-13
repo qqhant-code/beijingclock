@@ -49,9 +49,9 @@ struct ContentView: View {
 
                 // 内联预览层（也是 PiP 源，必须可见 PiP 才能起来）
                 SampleBufferDisplayViewRepresentable(sampleView: FloatingClockManager.shared.sampleView)
-                    .frame(width: 220, height: 37)
+                    .frame(width: 440, height: 74)
                     .background(Color.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     .padding(.vertical, 6)
 
                 // 悬浮窗状态（诊断用）
@@ -107,6 +107,7 @@ struct ContentView: View {
         .onAppear {
             resync()
             FloatingClockManager.shared.startPreview()
+            FloatingClockManager.shared.notifyInlineViewReady()
         }
         .onReceive(NotificationCenter.default.publisher(for: FloatingClockManager.pipStateNotification)) { _ in
             pipActive = FloatingClockManager.shared.pipActive

@@ -8,8 +8,8 @@ import UIKit
 enum ClockFrameRenderer {
 
     /// 画中画帧尺寸（决定悬浮窗默认比例）。
-    /// 细长条 720x120，类似 zk 助手顶部悬浮条比例。
-    static let frameSize = CGSize(width: 720, height: 120)
+    /// 细长条 1440x240，类似 zk 助手顶部悬浮条比例；按 2x 渲染保证 PiP 窗口文字清晰。
+    static let frameSize = CGSize(width: 1440, height: 240)
 
     /// 画面是否垂直翻转。若 PiP 里字是倒的，在 App 内点「画面翻转」即可，无需重新编译。
     static var flipVertical = false
@@ -30,7 +30,7 @@ enum ClockFrameRenderer {
             UIRectFill(CGRect(origin: .zero, size: size))
 
             // 细长条适配：字高约占画布 55%，完整显示
-            let font = UIFont.monospacedSystemFont(ofSize: 30, weight: .semibold)
+            let font = UIFont.monospacedSystemFont(ofSize: 60, weight: .semibold)
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: font,
                 .foregroundColor: UIColor.white

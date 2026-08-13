@@ -9,7 +9,7 @@ import UIKit
 /// 原理（与"zk助手"一致的画中画悬浮方案）：
 /// 1. 用一个 `AVSampleBufferDisplayLayer` 逐帧播放"北京时间"画面；
 /// 2. 以它为源创建 `AVPictureInPictureController`，启动后画面变成系统级悬浮窗，盖在所有 App 之上；
-/// 3. `Timer` 每秒推一帧 → 秒级跳动；
+/// 3. `Timer` 每 0.1 秒推一帧 → 秒级跳动；
 /// 4. 静音 `AVAudioEngine` 后台循环播放 + `UIBackgroundModes: audio` → App 在后台不被挂起，悬浮窗持续跳秒；
 /// 5. 时间来自网络授时(TimeSync)，不受设备系统时间篡改影响。
 final class FloatingClockManager: NSObject {
@@ -20,6 +20,7 @@ final class FloatingClockManager: NSObject {
     static let pipStateNotification = Notification.Name("BeijingClockPipStateChanged")
 
     private var pipController: AVPictureInPictureController?
+    private var pipPossibleObserver: NSKeyValueObservation?
     private var pumpTimer: Timer?
     private var previewTimer: Timer?
     /// 内联预览视图，同时也是 PiP 源。由 ContentView 通过 UIViewRepresentable 挂载到界面。
@@ -27,6 +28,9 @@ final class FloatingClockManager: NSObject {
         let size = ClockFrameRenderer.frameSize
         let v = SampleBufferDisplayView(frame: CGRect(origin: .zero, size: size))
         v.isUserInteractionEnabled = false
+        v.onDidMoveToWindow = { [weak self] in
+            self?.onInlineViewMovedToWindow()
+        }
         return v
     }()
     private let audioEngine = AVAudioEngine()
@@ -34,6 +38,7 @@ final class FloatingClockManager: NSObject {
     private var resyncTimer: Timer?
     private var retryTimer: Timer?
     private var running = false
+    private var pendingPiPStart = false
 
     /// 网络授时偏差，由外部/定时器刷新
     var offset: TimeInterval = 0
@@ -42,6 +47,7 @@ final class FloatingClockManager: NSObject {
     private(set) var pipActive = false
     private(set) var pipError: String?
     private(set) var retryCount = 0
+    private(set) var inlineViewReady = false
 
     var isRunning: Bool { running }
 
@@ -68,10 +74,9 @@ final class FloatingClockManager: NSObject {
         enqueueFrame()
         startPump()
 
-        // 给 inline 预览层一点时间渲染，再启动 PiP
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.tryStartPiP()
-        }
+        // 等内联视图真正进入 window 后再启动 PiP
+        pendingPiPStart = true
+        schedulePiPStartAttempt()
 
         // 每 5 分钟重新校时一次，修正漂移
         resyncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
@@ -82,8 +87,11 @@ final class FloatingClockManager: NSObject {
     }
 
     func stop() {
+        pendingPiPStart = false
         retryTimer?.invalidate()
         retryTimer = nil
+        pipPossibleObserver?.invalidate()
+        pipPossibleObserver = nil
         pipController?.stopPictureInPicture()
         stopPump()
         stopSilentAudio()
@@ -97,6 +105,24 @@ final class FloatingClockManager: NSObject {
         postState()
     }
 
+    /// ContentView 的内联视图已就位后调用
+    func notifyInlineViewReady() {
+        inlineViewReady = true
+        onInlineViewMovedToWindow()
+    }
+
+    private func onInlineViewMovedToWindow() {
+        guard pendingPiPStart else { return }
+        guard sampleView.window != nil else {
+            print("内联视图尚未进入 window，继续等待")
+            return
+        }
+        // 视图已进入 window，给 layer 一帧时间建立连接
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.tryStartPiP()
+        }
+    }
+
     /// 手动重试启动 PiP（供 UI 按钮调用）
     func retryStartPiP() {
         guard running else {
@@ -106,13 +132,10 @@ final class FloatingClockManager: NSObject {
         }
         retryCount = 0
         pipError = nil
+        pendingPiPStart = true
         postState()
         tryStartPiP()
     }
-
-    // MARK: - 内联预览视图（也是 PiP 源）
-    // sampleView 由 ContentView 通过 UIViewRepresentable 托管并显示在界面内，
-    // 这是 PiP 能成功启动的关键：layer 必须在可见的 view hierarchy 里。
 
     // MARK: - PiP
 
@@ -127,36 +150,61 @@ final class FloatingClockManager: NSObject {
         pip.canStartPictureInPictureAutomaticallyFromInline = true
         pip.delegate = self
         pipController = pip
+
+        // 监听 isPictureInPicturePossible，一旦变为 true 立即启动
+        pipPossibleObserver?.invalidate()
+        pipPossibleObserver = pip.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] _, change in
+            guard let self = self, let possible = change.newValue, possible else { return }
+            DispatchQueue.main.async {
+                self.tryStartPiP()
+            }
+        }
+    }
+
+    private func schedulePiPStartAttempt() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.tryStartPiP()
+        }
     }
 
     private func tryStartPiP() {
         guard let pip = pipController else { return }
+        guard running else { return }
+
+        guard sampleView.window != nil else {
+            pipError = "内联预览层尚未显示，请稍后再试"
+            postState()
+            return
+        }
+
         guard !pip.isPictureInPictureActive else {
             pipActive = true
             pipError = nil
+            pendingPiPStart = false
             postState()
             return
         }
-
-        // 很多情况下 isPictureInPicturePossible 为 false 只是 layer 还没 ready，
-        // 直接调用 startPictureInPicture() 经常仍然能起来。
-        pip.startPictureInPicture()
 
         if pip.isPictureInPicturePossible {
+            pip.startPictureInPicture()
             pipError = nil
+            pendingPiPStart = false
             postState()
             return
         }
 
-        // 否则轮询重试
+        // 如果当前不可能，自动轮询重试（layer 可能还没准备好）
         retryCount += 1
-        if retryCount <= 12 {
+        if retryCount <= 20 {
+            pipError = "PiP 尚未就绪，正在等待系统准备 (\(retryCount)/20)"
+            postState()
             retryTimer?.invalidate()
             retryTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
                 self?.tryStartPiP()
             }
         } else {
-            pipError = "自动启动失败，请点「重试悬浮窗」"
+            pipError = "自动启动失败，请点「重试悬浮窗」；或检查系统设置是否允许画中画"
+            pendingPiPStart = false
             postState()
         }
     }
@@ -190,6 +238,10 @@ final class FloatingClockManager: NSObject {
 
     func enqueueFrame() {
         let layer = sampleView.sampleBufferLayer
+        guard layer.isReadyForMoreMediaData else {
+            print("AVSampleBufferDisplayLayer 未准备好接收数据，跳过本帧")
+            return
+        }
         let now = Date().addingTimeInterval(offset)
         if let sbuf = ClockFrameRenderer.makeSampleBuffer(text: TimeSync.formatBeijingPrecise(now)) {
             layer.enqueue(sbuf)
@@ -278,6 +330,7 @@ extension FloatingClockManager: AVPictureInPictureControllerDelegate {
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         pipActive = true
         pipError = nil
+        pendingPiPStart = false
         retryTimer?.invalidate()
         retryTimer = nil
         postState()
@@ -291,6 +344,7 @@ extension FloatingClockManager: AVPictureInPictureControllerDelegate {
         // 失败后自动再试一次
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.retryCount = 0
+            self?.pendingPiPStart = true
             self?.tryStartPiP()
         }
     }
