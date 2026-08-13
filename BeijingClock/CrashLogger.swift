@@ -84,7 +84,7 @@ final class CrashLogger {
         for (sig, _) in signals {
             signal(sig) { s in
                 let n = signals.first(where: { $0.0 == s })?.1 ?? "signal \(s)"
-                let text = "=== \(n) @ \(CrashLogger.ts()) ===\n\(CrashLogger.backtrace())\n"
+                let text = "=== \(n) @ \(CrashLogger.ts()) ===\n\(CrashLogger.captureBacktrace())\n"
                 CrashLogger.shared.writeCrash(text)
                 signal(s, SIG_DFL)   // 恢复默认处理，避免无限递归
                 kill(getpid(), s)     // 交还系统，保留标准崩溃报告
@@ -97,9 +97,9 @@ final class CrashLogger {
         try? text.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    private static func backtrace() -> String {
+    private static func captureBacktrace() -> String {
         var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 64)
-        let count = backtrace(&frames, Int32(frames.count))
+        let count = Darwin.backtrace(&frames, Int32(frames.count))
         guard let syms = backtrace_symbols(&frames, count) else { return "(无符号)" }
         defer { free(syms) }
         var out = ""
