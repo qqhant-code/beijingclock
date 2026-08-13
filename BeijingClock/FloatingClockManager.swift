@@ -1,6 +1,7 @@
 import AVFoundation
 import AVKit
 import CoreMedia
+import QuartzCore
 import UIKit
 
 /// 悬浮时钟核心控制器。
@@ -8,7 +9,7 @@ import UIKit
 /// 原理（与"zk助手"一致的画中画悬浮方案）：
 /// 1. 用一个 `AVSampleBufferDisplayLayer` 逐帧播放"北京时间"画面；
 /// 2. 以它为源创建 `AVPictureInPictureController`，启动后画面变成系统级悬浮窗，盖在所有 App 之上；
-/// 3. `CADisplayLink` 每秒推一帧 → 秒级跳动；
+/// 3. `Timer` 每秒推一帧 → 秒级跳动；
 /// 4. 静音 `AVAudioEngine` 后台循环播放 + `UIBackgroundModes: audio` → App 在后台不被挂起，悬浮窗持续跳秒；
 /// 5. 时间来自网络授时(TimeSync)，不受设备系统时间篡改影响。
 final class FloatingClockManager: NSObject {
@@ -16,7 +17,7 @@ final class FloatingClockManager: NSObject {
     static let shared = FloatingClockManager()
 
     private var pipController: AVPictureInPictureController?
-    private var displayLink: CADisplayLink?
+    private var pumpTimer: Timer?
     private var sampleView: SampleBufferDisplayView?
     private let audioEngine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
@@ -108,21 +109,18 @@ final class FloatingClockManager: NSObject {
     // MARK: - 逐帧推流
 
     private func startPump() {
-        guard displayLink == nil else { return }
-        let link = CADisplayLink { [weak self] _ in
+        guard pumpTimer == nil else { return }
+        pumpTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.enqueueFrame()
         }
-        link.preferredFramesPerSecond = 1
-        link.add(to: .main, forMode: .common)
-        displayLink = link
     }
 
     private func stopPump() {
-        displayLink?.invalidate()
-        displayLink = nil
+        pumpTimer?.invalidate()
+        pumpTimer = nil
     }
 
-    private func enqueueFrame() {
+    func enqueueFrame() {
         guard let layer = sampleView?.sampleBufferLayer else { return }
         let now = Date().addingTimeInterval(offset)
         if let sbuf = ClockFrameRenderer.makeSampleBuffer(text: TimeSync.formatBeijing(now)) {
@@ -166,38 +164,44 @@ final class FloatingClockManager: NSObject {
 }
 
 // MARK: - PiP 播放回调（AVPictureInPictureController.ContentSource 必须提供）
+// 注意：下面三个 required 方法必须严格匹配 SDK 签名。
 
 extension FloatingClockManager: AVPictureInPictureSampleBufferPlaybackDelegate {
-    // 以下三个是 required 方法，必须实现
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
-                                    timeRangeForPlayback playback: AVPictureInPictureControllerPlayback) -> CMTimeRange {
+
+    // required
+    func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
         CMTimeRange(start: .zero, duration: .positiveInfinity)
     }
 
+    // required
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     didTransitionToRenderSize newRenderSize: CMVideoDimensions) {
         // 尺寸切换无需处理
     }
 
+    // required
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     skipByInterval skipInterval: CMTime,
                                     completion completionHandler: @escaping () -> Void) {
         completionHandler()
     }
 
-    // optional 方法
+    // optional
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     setPlaying playing: Bool) {
         if playing { startPump() } else { stopPump() }
     }
 
+    // optional
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     setRate rate: Float) {}
 
+    // optional
     func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
         false
     }
 
+    // optional
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     didRequestSampleBufferForPlaybackTime playbackTime: CMTime) {
         enqueueFrame()
