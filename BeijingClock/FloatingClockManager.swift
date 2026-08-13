@@ -39,7 +39,11 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
     // MARK: - 启停
 
     func start() {
-        guard !running else { return }
+        CrashLogger.shared.log("start() 进入")
+        guard !running else {
+            CrashLogger.shared.log("start() 已 running，直接返回")
+            return
+        }
         guard FloatingClockWindow.shared == nil else {
             FloatingClockWindow.shared?.showFloating()
             running = true
@@ -49,11 +53,14 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
             return
         }
 
+        CrashLogger.shared.log("start() 调用 startSilentAudio 前")
         startSilentAudio()
+        CrashLogger.shared.log("start() startSilentAudio 返回")
 
         // 取当前活跃的 UIWindowScene 来创建悬浮窗
         guard let scene = UIApplication.shared.connectedScenes
                 .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else {
+            CrashLogger.shared.log("start() 未获取到 foregroundActive scene，0.5s 后重试")
             lastError = "未能获取窗口场景，0.5 秒后重试"
             postState()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -62,7 +69,9 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
             return
         }
 
+        CrashLogger.shared.log("start() 获取到 scene，准备创建 FloatingClockWindow")
         let win = FloatingClockWindow(scene: scene)
+        CrashLogger.shared.log("start() FloatingClockWindow 创建成功")
         win.showFloating()
         FloatingClockWindow.shared = win
         floating = true
@@ -72,6 +81,7 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
 
         updateTime()
         startPump()
+        CrashLogger.shared.log("start() 完成，悬浮窗已显示")
 
         // 每 5 分钟重新校时一次
         resyncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
@@ -116,27 +126,31 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
     /// 用 AVAudioPlayer 循环播放内存中的静音 WAV。
     /// 比 AVAudioEngine 稳得多，且只要 .playback 后台模式开启即可保活。
     private func startSilentAudio() {
+        CrashLogger.shared.log("startSilentAudio 进入")
         do {
             let sess = AVAudioSession.sharedInstance()
             try sess.setCategory(.playback, mode: .default,
                                  options: [.mixWithOthers, .duckOthers])
             try sess.setActive(true)
+            CrashLogger.shared.log("startSilentAudio AVAudioSession.setActive 成功")
         } catch {
-            print("audio session: \(error)")
+            CrashLogger.shared.log("startSilentAudio AVAudioSession 失败: \(error)")
         }
 
         guard let data = Self.makeSilentWav() else {
-            print("生成静音 WAV 失败，放弃音频保活（悬浮窗仍会显示）")
+            CrashLogger.shared.log("startSilentAudio 生成静音 WAV 失败")
             return
         }
+        CrashLogger.shared.log("startSilentAudio 静音 WAV 已生成，准备 AVAudioPlayer")
         do {
             let player = try AVAudioPlayer(data: data)
             player.numberOfLoops = -1   // 无限循环
             player.volume = 0
             player.play()
             silentPlayer = player
+            CrashLogger.shared.log("startSilentAudio AVAudioPlayer 已播放")
         } catch {
-            print("audio player: \(error)")
+            CrashLogger.shared.log("startSilentAudio AVAudioPlayer 失败: \(error)")
         }
     }
 

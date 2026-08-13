@@ -33,6 +33,7 @@ final class FloatingClockWindow: UIWindow {
     private var barTop: NSLayoutConstraint!
 
     init(scene: UIWindowScene) {
+        CrashLogger.shared.log("FloatingClockWindow.init 进入，screen=\(scene.screen.bounds)")
         super.init(windowScene: scene)
         // 高于状态栏，低于系统 alert，保证盖在所有普通 App 之上。
         // 用硬编码安全值避免依赖已废弃的 UIWindow.Level.statusBar。
@@ -41,6 +42,7 @@ final class FloatingClockWindow: UIWindow {
         self.backgroundColor = .clear
         self.isHidden = true
         setupRoot()
+        CrashLogger.shared.log("FloatingClockWindow.init 完成")
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }

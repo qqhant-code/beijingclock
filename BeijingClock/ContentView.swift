@@ -8,6 +8,9 @@ struct ContentView: View {
     @State private var lastSync = ""
     @State private var floating = false
     @State private var lastError: String?
+    @State private var crashText: String?
+    @State private var logText = ""
+    @State private var showLog = false
 
     var body: some View {
         ZStack {
@@ -16,6 +19,39 @@ struct ContentView: View {
                 Text("北京时间 · 悬浮时钟")
                     .foregroundColor(.gray)
                     .font(.title3)
+
+                // 崩溃日志（闪退后下次进入会显示，等效崩溃报告）
+                if let crash = crashText {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("⚠️ 检测到上次闪退，点下面复制发我")
+                            .foregroundColor(.red)
+                            .font(.caption)
+                        ScrollView(.vertical, showsIndicators: true) {
+                            Text(crash)
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundColor(.orange)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 140)
+                        .padding(6)
+                        .background(Color(.darkGray))
+                        .cornerRadius(6)
+                        HStack {
+                            Button("复制崩溃日志") {
+                                UIPasteboard.general.string = crash
+                            }
+                            .foregroundColor(.red)
+                            .font(.caption)
+                            Button("清除") {
+                                CrashLogger.shared.clearCrash()
+                                crashText = nil
+                            }
+                            .foregroundColor(.gray)
+                            .font(.caption)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                }
 
                 VStack(spacing: 6) {
                     Text("开启后，时钟以悬浮窗形式盖在所有 App 上方")
@@ -78,9 +114,37 @@ struct ContentView: View {
 
                 Button("立即校时") { resync() }
                     .foregroundColor(.cyan)
+
+                Button("查看运行日志") {
+                    logText = CrashLogger.shared.lastLog() ?? "（暂无日志）"
+                    showLog = true
+                }
+                .foregroundColor(.gray)
+                .font(.caption)
+            }
+        }
+        .sheet(isPresented: $showLog) {
+            NavigationView {
+                ScrollView {
+                    Text(logText)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                }
+                .navigationTitle("运行日志")
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("复制") { UIPasteboard.general.string = logText }
+                    }
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("关闭") { showLog = false }
+                    }
+                }
             }
         }
         .onAppear {
+            crashText = CrashLogger.shared.lastCrash()
             resync()
             FloatingClockManager.shared.updateTime()
         }
@@ -94,13 +158,9 @@ struct ContentView: View {
     private func toggle() {
         if running {
             FloatingClockManager.shared.stop()
-            running = false
-            floating = false
         } else {
             resync {
                 FloatingClockManager.shared.start()
-                running = true
-                floating = true
             }
         }
     }
