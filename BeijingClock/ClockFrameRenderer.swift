@@ -10,18 +10,50 @@ enum ClockFrameRenderer {
     /// 画中画帧尺寸（决定悬浮窗默认比例，用户可在 PiP 里缩放）。
     static let frameSize = CGSize(width: 480, height: 160)
 
+    /// 画面是否垂直翻转。若 PiP 里字是倒的，在 App 内点「画面翻转」即可，无需重新编译。
+    static var flipVertical = false
+
     static func makeSampleBuffer(text: String) -> CMSampleBuffer? {
+        guard let buf = pixelBuffer(from: renderImage(text: text)) else { return nil }
+        return sampleBuffer(from: buf)
+    }
+
+    // MARK: - 用 UIKit 渲染文字（朝向 100% 正确，避开手动翻转坐标的坑）
+
+    private static func renderImage(text: String) -> UIImage {
+        let size = frameSize
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { _ in
+            UIColor.black.setFill()
+            UIRectFill(CGRect(origin: .zero, size: size))
+
+            let font = UIFont.monospacedSystemFont(ofSize: 46, weight: .medium)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: UIColor.white
+            ]
+            let str = NSAttributedString(string: text, attributes: attrs)
+            let textSize = str.size()
+            let point = CGPoint(x: (size.width - textSize.width) / 2,
+                                y: (size.height - textSize.height) / 2)
+            str.draw(at: point)
+        }
+    }
+
+    // MARK: - UIImage -> CVPixelBuffer（标准翻转绘制，匹配 AVSampleBufferDisplayLayer 朝向）
+
+    private static func pixelBuffer(from image: UIImage) -> CVPixelBuffer? {
         let w = Int(frameSize.width)
         let h = Int(frameSize.height)
 
         var pxbuf: CVPixelBuffer?
-        let pxAttrs: [String: Any] = [
+        let attrs: [String: Any] = [
             kCVPixelBufferCGImageCompatibilityKey as String: true,
             kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ]
         guard CVPixelBufferCreate(kCFAllocatorDefault, w, h,
-                                  kCVPixelFormatType_32BGRA, pxAttrs as CFDictionary, &pxbuf) == kCVReturnSuccess,
+                                  kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pxbuf) == kCVReturnSuccess,
               let buf = pxbuf else { return nil }
 
         CVPixelBufferLockBaseAddress(buf, [])
@@ -30,7 +62,6 @@ enum ClockFrameRenderer {
         guard let base = CVPixelBufferGetBaseAddress(buf) else { return nil }
         let bytesPerRow = CVPixelBufferGetBytesPerRow(buf)
 
-        // 32BGRA：little-endian + premultipliedFirst，这是往 CVPixelBuffer 画 CGContext 的通用组合
         let bitmapInfo = CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue
                                         | CGImageAlphaInfo.premultipliedFirst.rawValue)
         guard let ctx = CGContext(data: base, width: w, height: h,
@@ -38,27 +69,21 @@ enum ClockFrameRenderer {
                                   space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: bitmapInfo.rawValue) else { return nil }
 
-        // 背景：纯黑（圆角交给 PiP 窗口本身）
-        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        // 标准翻转：让 UIImage(上下正) 画进像素缓冲后也是上下正。
+        // 若 PiP 里仍倒着，把 flipVertical 设为 true 即可去掉这次翻转。
+        if !flipVertical {
+            ctx.translateBy(x: 0, y: CGFloat(h))
+            ctx.scaleBy(x: 1, y: -1)
+        }
+        if let cg = image.cgImage {
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        return buf
+    }
 
-        // 文字：等宽字体，白字，垂直水平居中
-        let font = CTFontCreateWithName("Menlo" as CFString, 44, nil)
-        let textAttrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: CGColor(red: 1, green: 1, blue: 1, alpha: 1)
-        ]
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: textAttrs))
-        let lineBounds = CTLineGetBoundsWithOptions(line, [])
-        let x = (CGFloat(w) - lineBounds.width) / 2
-        let y = (CGFloat(h) + lineBounds.height) / 2
+    // MARK: - CVPixelBuffer -> CMSampleBuffer
 
-        ctx.textMatrix = .identity
-        ctx.translateBy(x: 0, y: CGFloat(h))
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.textPosition = CGPoint(x: x, y: y)
-        CTLineDraw(line, ctx)
-
+    private static func sampleBuffer(from buf: CVPixelBuffer) -> CMSampleBuffer? {
         var timing = CMSampleTimingInfo(
             duration: .invalid,
             presentationTimeStamp: CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 600),

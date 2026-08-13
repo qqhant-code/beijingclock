@@ -16,6 +16,9 @@ final class FloatingClockManager: NSObject {
 
     static let shared = FloatingClockManager()
 
+    /// PiP 状态变化通知（供 UI 显示）
+    static let pipStateNotification = Notification.Name("BeijingClockPipStateChanged")
+
     private var pipController: AVPictureInPictureController?
     private var pumpTimer: Timer?
     private var sampleView: SampleBufferDisplayView?
@@ -27,6 +30,10 @@ final class FloatingClockManager: NSObject {
     /// 网络授时偏差，由外部/定时器刷新
     var offset: TimeInterval = 0
 
+    /// PiP 当前是否在系统级悬浮态（用于 UI 反馈）
+    private(set) var pipActive = false
+    private(set) var pipError: String?
+
     var isRunning: Bool { running }
 
     // MARK: - 启停
@@ -34,6 +41,8 @@ final class FloatingClockManager: NSObject {
     func start() {
         guard !running else { return }
         guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            pipError = "当前设备/系统不支持画中画(PiP)"
+            postState()
             print("当前设备/系统不支持画中画(PiP)")
             return
         }
@@ -43,10 +52,19 @@ final class FloatingClockManager: NSObject {
         setupPiP()
         running = true
 
-        // 先推一帧再启动 PiP（PiP 需要内联层已有可渲染内容）
+        // 先推一帧（PiP 需要内联层已有可渲染内容）
         enqueueFrame()
         startPump()
-        pipController?.startPictureInPicture()
+
+        // 等内联层完成首帧布局、且 PiP 可启动时再启动，否则 layer 未就绪 PiP 起不来。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self = self else { return }
+            if let pip = self.pipController, pip.isPictureInPicturePossible {
+                pip.startPictureInPicture()
+            } else {
+                print("PiP 暂不可启动（内联层可能未就绪）")
+            }
+        }
 
         // 每 5 分钟重新校时一次，修正漂移
         resyncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
@@ -66,26 +84,33 @@ final class FloatingClockManager: NSObject {
         sampleView = nil
         pipController = nil
         running = false
+        pipActive = false
+        postState()
     }
 
     // MARK: - 内联预览视图（也是 PiP 源）
 
     private func setupSampleView() {
         let size = ClockFrameRenderer.frameSize
-        let v = SampleBufferDisplayView(frame: .zero)
-        v.translatesAutoresizingMaskIntoConstraints = false
+        let v = SampleBufferDisplayView(frame: CGRect(x: 0, y: 0, width: size.width, height: size.height))
         v.isUserInteractionEnabled = false
-
-        if let window = keyWindow {
-            window.addSubview(v)
-            NSLayoutConstraint.activate([
-                v.widthAnchor.constraint(equalToConstant: size.width),
-                v.heightAnchor.constraint(equalToConstant: size.height),
-                v.centerXAnchor.constraint(equalTo: window.centerXAnchor),
-                v.topAnchor.constraint(equalTo: window.safeAreaLayoutGuide.topAnchor, constant: 12)
-            ])
-        }
         sampleView = v
+        attachToWindow(v)
+    }
+
+    private func attachToWindow(_ v: UIView) {
+        guard v.superview == nil else { return }
+        guard let window = keyWindow ?? firstWindow else {
+            print("找不到可用 window，无法挂载内联层")
+            return
+        }
+        window.addSubview(v)
+        v.frame = CGRect(x: 8,
+                         y: window.safeAreaInsets.top + 8,
+                         width: ClockFrameRenderer.frameSize.width,
+                         height: ClockFrameRenderer.frameSize.height)
+        window.bringSubviewToFront(v)
+        window.layoutIfNeeded()
     }
 
     private var keyWindow: UIWindow? {
@@ -93,16 +118,25 @@ final class FloatingClockManager: NSObject {
             .windows.first(where: { $0.isKeyWindow })
     }
 
+    private var firstWindow: UIWindow? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first
+    }
+
     // MARK: - PiP
 
     private func setupPiP() {
         guard let layer = sampleView?.sampleBufferLayer else { return }
+        layer.videoGravity = .resizeAspectFill
         let source = AVPictureInPictureController.ContentSource(
             sampleBufferDisplayLayer: layer,
             playbackDelegate: self
         )
         let pip = AVPictureInPictureController(contentSource: source)
         pip.canStartPictureInPictureAutomaticallyFromInline = true
+        pip.delegate = self
         pipController = pip
     }
 
@@ -126,6 +160,12 @@ final class FloatingClockManager: NSObject {
         if let sbuf = ClockFrameRenderer.makeSampleBuffer(text: TimeSync.formatBeijing(now)) {
             layer.enqueue(sbuf)
         }
+    }
+
+    // MARK: - 状态通知
+
+    private func postState() {
+        NotificationCenter.default.post(name: Self.pipStateNotification, object: nil)
     }
 
     // MARK: - 静音后台音频保活
@@ -164,46 +204,58 @@ final class FloatingClockManager: NSObject {
 }
 
 // MARK: - PiP 播放回调（AVPictureInPictureController.ContentSource 必须提供）
-// 注意：下面三个 required 方法必须严格匹配 SDK 签名。
 
 extension FloatingClockManager: AVPictureInPictureSampleBufferPlaybackDelegate {
 
-    // required
     func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
         CMTimeRange(start: .zero, duration: .positiveInfinity)
     }
 
-    // required
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
-                                    didTransitionToRenderSize newRenderSize: CMVideoDimensions) {
-        // 尺寸切换无需处理
-    }
+                                    didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
 
-    // required
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     skipByInterval skipInterval: CMTime,
                                     completion completionHandler: @escaping () -> Void) {
         completionHandler()
     }
 
-    // optional
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     setPlaying playing: Bool) {
         if playing { startPump() } else { stopPump() }
     }
 
-    // optional
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     setRate rate: Float) {}
 
-    // optional
     func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
         false
     }
 
-    // optional
     func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     didRequestSampleBufferForPlaybackTime playbackTime: CMTime) {
         enqueueFrame()
+    }
+}
+
+// MARK: - PiP 生命周期回调（诊断悬浮是否成功）
+
+extension FloatingClockManager: AVPictureInPictureControllerDelegate {
+    func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        pipActive = true
+        pipError = nil
+        postState()
+    }
+
+    func pictureInPictureControllerFailedToStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController, withError error: Error) {
+        pipActive = false
+        pipError = error.localizedDescription
+        postState()
+        print("PiP 启动失败: \(error)")
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        pipActive = false
+        postState()
     }
 }

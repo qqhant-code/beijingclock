@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import UIKit
 
@@ -6,6 +7,8 @@ struct ContentView: View {
     @State private var running = false
     @State private var status = "校时中…"
     @State private var lastSync = ""
+    @State private var pipActive = false
+    @State private var pipError: String?
 
     var body: some View {
         ZStack {
@@ -35,6 +38,15 @@ struct ContentView: View {
                     }
                 }
 
+                // 悬浮窗状态（诊断用）
+                HStack(spacing: 6) {
+                    Image(systemName: "airplayvideo")
+                        .foregroundColor(pipActive ? .green : (pipError == nil ? .gray : .red))
+                    Text(pipActive ? "悬浮窗运行中" : (pipError == nil ? "悬浮窗未启动" : "悬浮窗启动失败"))
+                        .foregroundColor(pipError == nil ? .gray : .red)
+                        .font(.caption)
+                }
+
                 Button(action: toggle) {
                     Text(running ? "关闭悬浮时钟" : "开启悬浮时钟")
                         .padding(.horizontal, 26).padding(.vertical, 11)
@@ -43,17 +55,31 @@ struct ContentView: View {
                         .clipShape(Capsule())
                 }
 
+                if running {
+                    Button("画面翻转（若字倒着点这里）") {
+                        ClockFrameRenderer.flipVertical.toggle()
+                        FloatingClockManager.shared.enqueueFrame()
+                    }
+                    .foregroundColor(.orange)
+                    .font(.caption)
+                }
+
                 Button("立即校时") { resync() }
                     .foregroundColor(.cyan)
             }
         }
         .onAppear { resync() }
+        .onReceive(NotificationCenter.default.publisher(for: FloatingClockManager.pipStateNotification)) { _ in
+            pipActive = FloatingClockManager.shared.pipActive
+            pipError = FloatingClockManager.shared.pipError
+        }
     }
 
     private func toggle() {
         if running {
             FloatingClockManager.shared.stop()
             running = false
+            pipActive = false
         } else {
             // 先确保已校时，再启动悬浮窗
             resync {
