@@ -44,6 +44,7 @@ final class FloatingClockManager: NSObject {
 
         // 先推一帧再启动 PiP（PiP 需要内联层已有可渲染内容）
         enqueueFrame()
+        startPump()
         pipController?.startPictureInPicture()
 
         // 每 5 分钟重新校时一次，修正漂移
@@ -108,9 +109,11 @@ final class FloatingClockManager: NSObject {
 
     private func startPump() {
         guard displayLink == nil else { return }
-        let link = CADisplayLink(mode: .common, preferredFramesPerSecond: 1) { [weak self] _ in
+        let link = CADisplayLink { [weak self] _ in
             self?.enqueueFrame()
         }
+        link.preferredFramesPerSecond = 1
+        link.add(to: .main, forMode: .common)
         displayLink = link
     }
 
@@ -165,21 +168,37 @@ final class FloatingClockManager: NSObject {
 // MARK: - PiP 播放回调（AVPictureInPictureController.ContentSource 必须提供）
 
 extension FloatingClockManager: AVPictureInPictureSampleBufferPlaybackDelegate {
-    func pictureInPictureController(_ pip: AVPictureInPictureController, setPlaying playing: Bool) {
+    // 以下三个是 required 方法，必须实现
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
+                                    timeRangeForPlayback playback: AVPictureInPictureControllerPlayback) -> CMTimeRange {
+        CMTimeRange(start: .zero, duration: .positiveInfinity)
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
+                                    didTransitionToRenderSize newRenderSize: CMVideoDimensions) {
+        // 尺寸切换无需处理
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
+                                    skipByInterval skipInterval: CMTime,
+                                    completion completionHandler: @escaping () -> Void) {
+        completionHandler()
+    }
+
+    // optional 方法
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
+                                    setPlaying playing: Bool) {
         if playing { startPump() } else { stopPump() }
     }
 
-    func pictureInPictureController(_ pip: AVPictureInPictureController, setRate rate: Float) {}
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
+                                    setRate rate: Float) {}
 
-    func pictureInPictureControllerTimeRange(forPlayback pip: AVPictureInPictureController) -> CMTimeRange {
-        CMTimeRange(start: CMTime.zero, duration: CMTime.positiveInfinity)
-    }
-
-    func pictureInPictureControllerIsPlaybackPaused(_ pip: AVPictureInPictureController) -> Bool {
+    func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
         false
     }
 
-    func pictureInPictureController(_ pip: AVPictureInPictureController,
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
                                     didRequestSampleBufferForPlaybackTime playbackTime: CMTime) {
         enqueueFrame()
     }
