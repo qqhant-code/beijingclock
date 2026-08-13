@@ -9,7 +9,7 @@ import UIKit
 /// 2. 后台静音音频保活（`UIBackgroundModes: audio` + 循环静音 AVAudioEngine），
 ///    App 退到后台不被挂起，悬浮窗持续跳秒；
 /// 3. `Timer` 每 0.1 秒刷新一次北京时间（来自网络授时 TimeSync，不受系统时间影响）。
-final class FloatingClockManager: NSObject {
+final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
 
     static let shared = FloatingClockManager()
 
@@ -20,6 +20,11 @@ final class FloatingClockManager: NSObject {
     private let playerNode = AVAudioPlayerNode()
     private let locationManager = CLLocationManager()
     private var locationKeepAlive = false
+
+    private override init() {
+        super.init()
+        locationManager.delegate = self
+    }
     private var pumpTimer: Timer?
     private var resyncTimer: Timer?
     private var running = false
@@ -152,11 +157,21 @@ final class FloatingClockManager: NSObject {
     }
 
     private func startLocationUpdates() {
-        guard CLLocationManager.authorizationStatus() == .authorizedWhenInUse ||
-              CLLocationManager.authorizationStatus() == .authorizedAlways else { return }
+        let status = locationManager.authorizationStatus
+        guard status == .authorizedWhenInUse || status == .authorizedAlways else { return }
         locationManager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
         locationManager.distanceFilter = CLLocationDistanceMax
         locationManager.startUpdatingLocation()
         locationKeepAlive = true
+    }
+
+    // MARK: - CLLocationManagerDelegate
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        // 仅用于保活，不处理位置数据
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        // 忽略定位错误，保持音频保活即可
     }
 }

@@ -12,5 +12,8 @@ targets:
       - path: BeijingClock
         excludes:
           - Info.plist
+    dependencies:
+      - sdk: AVFoundation.framework
+      - sdk: CoreLocation.framework
     info:
       path: BeijingClock/Info.plist
