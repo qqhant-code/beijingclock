@@ -1,35 +1,24 @@
-import Combine
 import SwiftUI
 import UIKit
-
-/// 把 AVSampleBufferDisplayLayer 包装进 SwiftUI，作为内联预览 + PiP 源。
-struct SampleBufferDisplayViewRepresentable: UIViewRepresentable {
-    let sampleView: SampleBufferDisplayView
-
-    func makeUIView(context: Context) -> SampleBufferDisplayView { sampleView }
-    func updateUIView(_ uiView: SampleBufferDisplayView, context: Context) {}
-}
 
 struct ContentView: View {
 
     @State private var running = false
     @State private var status = "校时中…"
     @State private var lastSync = ""
-    @State private var pipActive = false
-    @State private var pipError: String?
-    @State private var retryCount = 0
+    @State private var floating = false
+    @State private var lastError: String?
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            VStack(spacing: 20) {
+            VStack(spacing: 22) {
                 Text("北京时间 · 悬浮时钟")
                     .foregroundColor(.gray)
                     .font(.title3)
 
-                // 说明
                 VStack(spacing: 6) {
-                    Text("开启后，时钟以画中画形式悬浮在所有 App 上方")
+                    Text("开启后，时钟以悬浮窗形式盖在所有 App 上方")
                     Text("秒级跳动 · 不受系统时间影响 · 后台持续运行")
                 }
                 .font(.caption)
@@ -47,33 +36,21 @@ struct ContentView: View {
                     }
                 }
 
-                // 内联预览层（也是 PiP 源，必须可见 PiP 才能起来）
-                SampleBufferDisplayViewRepresentable(sampleView: FloatingClockManager.shared.sampleView)
-                    .frame(width: 440, height: 74)
-                    .background(Color.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .padding(.vertical, 6)
-
-                // 悬浮窗状态（诊断用）
+                // 悬浮窗状态
                 VStack(spacing: 4) {
                     HStack(spacing: 6) {
-                        Image(systemName: pipActive ? "pip.fill" : "pip")
-                            .foregroundColor(pipActive ? .green : (pipError == nil ? .gray : .red))
-                        Text(pipActive ? "悬浮窗运行中" : (pipError == nil ? "悬浮窗未启动" : "悬浮窗启动失败"))
-                            .foregroundColor(pipError == nil ? .gray : .red)
+                        Image(systemName: floating ? "rectangle.on.rectangle" : "rectangle.dashed")
+                            .foregroundColor(floating ? .green : (lastError == nil ? .gray : .red))
+                        Text(floating ? "悬浮窗运行中" : (lastError == nil ? "悬浮窗未开启" : "悬浮窗未开启"))
+                            .foregroundColor(lastError == nil ? .gray : .red)
                             .font(.caption)
                     }
-                    if let err = pipError {
+                    if let err = lastError {
                         Text(err)
                             .font(.caption2)
                             .foregroundColor(.red)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 30)
-                    }
-                    if retryCount > 0 && !pipActive && pipError == nil {
-                        Text("正在尝试启动…(\(retryCount))")
-                            .font(.caption2)
-                            .foregroundColor(.orange)
                     }
                 }
 
@@ -86,15 +63,14 @@ struct ContentView: View {
                 }
 
                 if running {
-                    Button("重试启动悬浮窗") {
-                        FloatingClockManager.shared.retryStartPiP()
-                    }
-                    .foregroundColor(.orange)
-                    .font(.caption)
+                    Text("提示：悬浮条可拖动；点右侧 ✕ 关闭。切到别的 App 后它仍会显示。")
+                        .font(.caption2)
+                        .foregroundColor(.gray)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 36)
 
-                    Button("画面翻转（若字倒着点这里）") {
-                        ClockFrameRenderer.flipVertical.toggle()
-                        FloatingClockManager.shared.enqueueFrame()
+                    Button("增强保活(定位，仿 zk 双保活)") {
+                        FloatingClockManager.shared.enableLocationKeepAlive()
                     }
                     .foregroundColor(.orange)
                     .font(.caption)
@@ -106,13 +82,11 @@ struct ContentView: View {
         }
         .onAppear {
             resync()
-            FloatingClockManager.shared.startPreview()
-            FloatingClockManager.shared.notifyInlineViewReady()
+            FloatingClockManager.shared.updateTime()
         }
         .onReceive(NotificationCenter.default.publisher(for: FloatingClockManager.pipStateNotification)) { _ in
-            pipActive = FloatingClockManager.shared.pipActive
-            pipError = FloatingClockManager.shared.pipError
-            retryCount = FloatingClockManager.shared.retryCount
+            floating = FloatingClockManager.shared.floating
+            lastError = FloatingClockManager.shared.lastError
         }
     }
 
@@ -120,12 +94,12 @@ struct ContentView: View {
         if running {
             FloatingClockManager.shared.stop()
             running = false
-            pipActive = false
+            floating = false
         } else {
-            // 先确保已校时，再启动悬浮窗
             resync {
                 FloatingClockManager.shared.start()
                 running = true
+                floating = true
             }
         }
     }
