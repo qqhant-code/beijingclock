@@ -1,4 +1,6 @@
 import AVFoundation
+import AVKit
+import CoreMedia
 import UIKit
 
 /// 悬浮时钟核心控制器。
@@ -9,7 +11,7 @@ import UIKit
 /// 3. `CADisplayLink` 每秒推一帧 → 秒级跳动；
 /// 4. 静音 `AVAudioEngine` 后台循环播放 + `UIBackgroundModes: audio` → App 在后台不被挂起，悬浮窗持续跳秒；
 /// 5. 时间来自网络授时(TimeSync)，不受设备系统时间篡改影响。
-final class FloatingClockManager {
+final class FloatingClockManager: NSObject {
 
     static let shared = FloatingClockManager()
 
@@ -45,7 +47,7 @@ final class FloatingClockManager {
         pipController?.startPictureInPicture()
 
         // 每 5 分钟重新校时一次，修正漂移
-        resyncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
+        resyncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             TimeSync.fetchOffset { [weak self] off in
                 if let off = off { self?.offset = off }
             }
@@ -94,19 +96,9 @@ final class FloatingClockManager {
     private func setupPiP() {
         guard let layer = sampleView?.sampleBufferLayer else { return }
         let source = AVPictureInPictureController.ContentSource(
-            sampleBufferDisplayLayer: layer
-        ) { [weak self] state in
-            DispatchQueue.main.async {
-                switch state {
-                case .playing:
-                    self?.startPump()
-                case .paused, .stopped:
-                    self?.stopPump()
-                default:
-                    break
-                }
-            }
-        }
+            sampleBufferDisplayLayer: layer,
+            playbackDelegate: self
+        )
         let pip = AVPictureInPictureController(contentSource: source)
         pip.canStartPictureInPictureAutomaticallyFromInline = true
         pipController = pip
@@ -116,19 +108,15 @@ final class FloatingClockManager {
 
     private func startPump() {
         guard displayLink == nil else { return }
-        let link = CADisplayLink(target: self, selector: #selector(tick))
-        link.preferredFramesPerSecond = 1   // 每秒一帧 = 秒级跳动
-        link.add(to: .main, forMode: .common)
+        let link = CADisplayLink(mode: .common, preferredFramesPerSecond: 1) { [weak self] _ in
+            self?.enqueueFrame()
+        }
         displayLink = link
     }
 
     private func stopPump() {
         displayLink?.invalidate()
         displayLink = nil
-    }
-
-    @objc private func tick() {
-        enqueueFrame()
     }
 
     private func enqueueFrame() {
@@ -171,5 +159,28 @@ final class FloatingClockManager {
         playerNode.stop()
         audioEngine.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+}
+
+// MARK: - PiP 播放回调（AVPictureInPictureController.ContentSource 必须提供）
+
+extension FloatingClockManager: AVPictureInPictureSampleBufferPlaybackDelegate {
+    func pictureInPictureController(_ pip: AVPictureInPictureController, setPlaying playing: Bool) {
+        if playing { startPump() } else { stopPump() }
+    }
+
+    func pictureInPictureController(_ pip: AVPictureInPictureController, setRate rate: Float) {}
+
+    func pictureInPictureControllerTimeRange(forPlayback pip: AVPictureInPictureController) -> CMTimeRange {
+        CMTimeRange(start: CMTime.zero, duration: CMTime.positiveInfinity)
+    }
+
+    func pictureInPictureControllerIsPlaybackPaused(_ pip: AVPictureInPictureController) -> Bool {
+        false
+    }
+
+    func pictureInPictureController(_ pip: AVPictureInPictureController,
+                                    didRequestSampleBufferForPlaybackTime playbackTime: CMTime) {
+        enqueueFrame()
     }
 }

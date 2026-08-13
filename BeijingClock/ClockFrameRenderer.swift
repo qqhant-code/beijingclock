@@ -15,13 +15,13 @@ enum ClockFrameRenderer {
         let h = Int(frameSize.height)
 
         var pxbuf: CVPixelBuffer?
-        let attrs: [String: Any] = [
+        let pxAttrs: [String: Any] = [
             kCVPixelBufferCGImageCompatibilityKey as String: true,
             kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ]
         guard CVPixelBufferCreate(kCFAllocatorDefault, w, h,
-                                  kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pxbuf) == kCVReturnSuccess,
+                                  kCVPixelFormatType_32BGRA, pxAttrs as CFDictionary, &pxbuf) == kCVReturnSuccess,
               let buf = pxbuf else { return nil }
 
         CVPixelBufferLockBaseAddress(buf, [])
@@ -44,11 +44,11 @@ enum ClockFrameRenderer {
 
         // 文字：等宽字体，白字，垂直水平居中
         let font = CTFontCreateWithName("Menlo" as CFString, 44, nil)
-        let attrs: [NSAttributedString.Key: Any] = [
+        let textAttrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: CGColor(red: 1, green: 1, blue: 1, alpha: 1)
         ]
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attrs))
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: textAttrs))
         let lineBounds = CTLineGetBoundsWithOptions(line, [])
         let x = (CGFloat(w) - lineBounds.width) / 2
         let y = (CGFloat(h) + lineBounds.height) / 2
@@ -60,8 +60,8 @@ enum ClockFrameRenderer {
         CTLineDraw(line, ctx)
 
         var timing = CMSampleTimingInfo(
-            presentationTimeStamp: CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 600),
             duration: .invalid,
+            presentationTimeStamp: CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 600),
             decodeTimeStamp: .invalid
         )
         var fmt: CMFormatDescription?

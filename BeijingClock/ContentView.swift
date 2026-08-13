@@ -47,7 +47,7 @@ struct ContentView: View {
                     .foregroundColor(.cyan)
             }
         }
-        .onAppear(perform: resync)
+        .onAppear { resync() }
     }
 
     private func toggle() {
