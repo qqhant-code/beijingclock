@@ -1,0 +1,16 @@
+name: BeijingClock
+options:
+  bundleIdPrefix: com.beijingclock
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+targets:
+  BeijingClock:
+    type: application
+    platform: iOS
+    sources:
+      - path: BeijingClock
+        excludes:
+          - Info.plist
+    info:
+      path: BeijingClock/Info.plist

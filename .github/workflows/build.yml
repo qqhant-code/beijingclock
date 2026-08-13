@@ -1,0 +1,42 @@
+name: Build IPA (TrollStore)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive (ad-hoc, no signing)
+        run: |
+          xcodebuild archive \
+            -project BeijingClock.xcodeproj \
+            -scheme BeijingClock \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/BeijingClock.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package IPA
+        run: |
+          mkdir -p build/Payload
+          cp -r "build/BeijingClock.xcarchive/Products/Applications/BeijingClock.app" build/Payload/
+          cd build && zip -r BeijingClock.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeijingClock.ipa
+          path: build/BeijingClock.ipa

@@ -1,0 +1,13 @@
+# Xcode 构建产物
+build/
+*.xcarchive
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# 出包
+*.ipa
+Payload/
+
+# 系统
+.DS_Store
