@@ -21,8 +21,11 @@ final class CrashLogger {
     // MARK: - 安装
 
     func setup() {
-        installExceptionHandler()
-        installSignalHandler()
+        // 必须是"非捕获上下文"的函数才能转成 C 函数指针（signal/异常系统要求）。
+        NSSetUncaughtExceptionHandler(exceptionHandler)
+        for sig in [SIGABRT, SIGILL, SIGSEGV, SIGBUS, SIGTRAP, SIGFPE] {
+            signal(sig, bcSignalHandler)
+        }
     }
 
     // MARK: - 运行日志（类 logcat）
@@ -59,39 +62,6 @@ final class CrashLogger {
         if let url = crashURL { try? FileManager.default.removeItem(at: url) }
     }
 
-    // MARK: - 异常捕获
-
-    private func installExceptionHandler() {
-        NSSetUncaughtExceptionHandler { exc in
-            let stack = (exc.callStackSymbols as [String]).joined(separator: "\n")
-            let text = """
-            === UNCAUGHT EXCEPTION @ \(Self.ts()) ===
-            Name : \(exc.name)
-            Reason: \(exc.reason ?? "(无)")
-            Thread: \(Thread.isMainThread ? "main" : "background")
-            Call stack:
-            \(stack)
-            """
-            CrashLogger.shared.writeCrash(text)
-        }
-    }
-
-    private func installSignalHandler() {
-        let signals: [(Int32, String)] = [
-            (SIGABRT, "SIGABRT"), (SIGILL, "SIGILL"), (SIGSEGV, "SIGSEGV"),
-            (SIGBUS, "SIGBUS"), (SIGTRAP, "SIGTRAP"), (SIGFPE, "SIGFPE")
-        ]
-        for (sig, _) in signals {
-            signal(sig) { s in
-                let n = signals.first(where: { $0.0 == s })?.1 ?? "signal \(s)"
-                let text = "=== \(n) @ \(CrashLogger.ts()) ===\n\(CrashLogger.captureBacktrace())\n"
-                CrashLogger.shared.writeCrash(text)
-                signal(s, SIG_DFL)   // 恢复默认处理，避免无限递归
-                kill(getpid(), s)     // 交还系统，保留标准崩溃报告
-            }
-        }
-    }
-
     private func writeCrash(_ text: String) {
         guard let url = crashURL else { return }
         try? text.write(to: url, atomically: true, encoding: .utf8)
@@ -114,4 +84,36 @@ final class CrashLogger {
         f.dateFormat = "HH:mm:ss.SSS"
         return f.string(from: Date())
     }
+}
+
+// MARK: - 文件级崩溃处理器（非捕获函数，才能转 C 函数指针）
+
+private func exceptionHandler(_ exc: NSException) {
+    let stack = (exc.callStackSymbols as [String]).joined(separator: "\n")
+    let text = """
+    === UNCAUGHT EXCEPTION @ \(CrashLogger.ts()) ===
+    Name : \(exc.name)
+    Reason: \(exc.reason ?? "(无)")
+    Thread: \(Thread.isMainThread ? "main" : "background")
+    Call stack:
+    \(stack)
+    """
+    CrashLogger.shared.writeCrash(text)
+}
+
+private func bcSignalHandler(_ sig: Int32) {
+    let name: String
+    switch sig {
+    case SIGABRT: name = "SIGABRT"
+    case SIGILL:  name = "SIGILL"
+    case SIGSEGV: name = "SIGSEGV"
+    case SIGBUS:  name = "SIGBUS"
+    case SIGTRAP: name = "SIGTRAP"
+    case SIGFPE:  name = "SIGFPE"
+    default:      name = "signal \(sig)"
+    }
+    let text = "=== \(name) @ \(CrashLogger.ts()) ===\n\(CrashLogger.captureBacktrace())\n"
+    CrashLogger.shared.writeCrash(text)
+    signal(sig, SIG_DFL)
+    kill(getpid(), sig)
 }
