@@ -62,12 +62,12 @@ final class CrashLogger {
         if let url = crashURL { try? FileManager.default.removeItem(at: url) }
     }
 
-    private func writeCrash(_ text: String) {
+    fileprivate func writeCrash(_ text: String) {
         guard let url = crashURL else { return }
         try? text.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    private static func captureBacktrace() -> String {
+    fileprivate static func captureBacktrace() -> String {
         var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 64)
         let count = Darwin.backtrace(&frames, Int32(frames.count))
         guard let syms = backtrace_symbols(&frames, count) else { return "(无符号)" }
@@ -79,7 +79,7 @@ final class CrashLogger {
         return out
     }
 
-    private static func ts() -> String {
+    fileprivate static func ts() -> String {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
         return f.string(from: Date())
