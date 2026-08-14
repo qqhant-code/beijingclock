@@ -156,7 +156,7 @@ struct ContentView: View {
     }
 
     private func toggle() {
-        if running {
+        if FloatingClockManager.shared.isRunning {
             FloatingClockManager.shared.stop()
         } else {
             resync {

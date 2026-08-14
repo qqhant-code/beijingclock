@@ -33,6 +33,7 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
     }
     private var pumpTimer: Timer?
     private var resyncTimer: Timer?
+    private var heartbeatTimer: Timer?
     private var running = false
 
     /// 网络授时偏差
@@ -85,6 +86,7 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
 
         updateTime()
         startPump()
+        startHeartbeat()
 
         // 2) 立即启动静音音频保活（约束崩溃已定位修复，不再需要延迟）
         CrashLogger.shared.log("start() 立即启动音频保活")
@@ -104,6 +106,7 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
     func stop() {
         pumpTimer?.invalidate(); pumpTimer = nil
         resyncTimer?.invalidate(); resyncTimer = nil
+        stopHeartbeat()
         stopSilentAudio()
         locationManager.stopUpdatingLocation()
         locationKeepAlive = false
@@ -121,6 +124,23 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         pumpTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.updateTime()
         }
+    }
+
+    /// 每 5 秒记录一次存活状态，用于诊断"切到别的 App 后是否仍活着"。
+    /// 若切后台后日志不再出现 heartbeat，说明进程已被系统挂起（保活失败）。
+    private func startHeartbeat() {
+        guard heartbeatTimer == nil else { return }
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let st = UIApplication.shared.applicationState
+            let playing = self.silentPlayer?.isPlaying ?? false
+            let hidden = FloatingClockWindow.shared?.isHidden ?? true
+            CrashLogger.shared.log("heartbeat appState=\(st.rawValue) playing=\(playing) windowHidden=\(hidden) running=\(self.running)")
+        }
+    }
+
+    private func stopHeartbeat() {
+        heartbeatTimer?.invalidate(); heartbeatTimer = nil
     }
 
     func updateTime() {
@@ -158,7 +178,7 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         do {
             let player = try AVAudioPlayer(data: data)
             player.numberOfLoops = -1   // 无限循环
-            player.volume = 0
+            player.volume = 1           // 数据本身极弱，放大后仍听不到；必须是 1 才能驱动后台保活
             player.play()
             silentPlayer = player
             CrashLogger.shared.log("startSilentAudio AVAudioPlayer 已播放")
@@ -173,13 +193,17 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    /// 生成一段 5 秒静音 16-bit PCM WAV，避免打包外部音频文件。
-    /// 比 0.1 秒更不易被系统判定为"空闲/已结束"，后台保活更稳。
+    /// 生成 5 秒 16-bit PCM WAV（避免打包外部音频文件）。
+    ///
+    /// 关键修复：数据**不能是全 0**。iOS 不会对"零输出"音频给予后台保活，
+    /// 因此这里写入极低幅度（≈0.012%）的 60Hz 正弦波——人耳几乎听不到，
+    /// 但系统会判定为"正在播放音频"，从而让 App 在后台持续运行、悬浮窗不消失。
     private static func makeSilentWav() -> Data? {
         let sampleRate: UInt32 = 8000
         let numChannels: UInt16 = 1
         let bitsPerSample: UInt16 = 16
-        let numSamples: UInt32 = sampleRate * 5
+        let duration: UInt32 = 5
+        let numSamples: UInt32 = sampleRate * duration
         let blockAlign = numChannels * (bitsPerSample / 8)
         let byteRate = sampleRate * UInt32(blockAlign)
         let dataSize = numSamples * UInt32(blockAlign)
@@ -199,7 +223,17 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         d.append(withUnsafeBytes(of: bitsPerSample.littleEndian) { Data($0) })
         d.append(contentsOf: [0x64, 0x61, 0x74, 0x61])          // "data"
         d.append(withUnsafeBytes(of: dataSize.littleEndian) { Data($0) })
-        d.append(Data(count: Int(dataSize)))                     // 全 0 = 静音
+
+        var samples = Data(count: Int(dataSize))
+        samples.withUnsafeMutableBytes { raw in
+            let ints = raw.bindMemory(to: Int16.self)
+            let amp = Double(4)   // 极小幅度，听不到但非静音
+            for i in 0..<Int(numSamples) {
+                let t = Double(i) / Double(sampleRate)
+                ints[i] = Int16(sin(2 * Double.pi * 60 * t) * amp)
+            }
+        }
+        d.append(samples)
         return d
     }
 
@@ -229,13 +263,18 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
     // MARK: - 前后台 & 音频中断恢复
 
     @objc private func appDidEnterBackground() {
-        CrashLogger.shared.log("进入后台，恢复音频保活")
+        let st = UIApplication.shared.applicationState
+        let playing = silentPlayer?.isPlaying ?? false
+        let hidden = FloatingClockWindow.shared?.isHidden ?? true
+        CrashLogger.shared.log("进入后台: appState=\(st.rawValue) playing=\(playing) windowHidden=\(hidden) running=\(running)")
         guard running else { return }
         startSilentAudio()
     }
 
     @objc private func appWillEnterForeground() {
-        CrashLogger.shared.log("回到前台，恢复音频保活")
+        let st = UIApplication.shared.applicationState
+        let playing = silentPlayer?.isPlaying ?? false
+        CrashLogger.shared.log("回到前台: appState=\(st.rawValue) playing=\(playing)")
         guard running else { return }
         startSilentAudio()
     }
