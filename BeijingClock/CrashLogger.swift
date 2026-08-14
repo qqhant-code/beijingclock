@@ -27,7 +27,7 @@ final class CrashLogger {
     private let q = DispatchQueue(label: "crashlogger")
 
     /// 标记：NSException 已写入报告，信号处理器据此避免覆盖。
-    private static var exceptionReported = false
+    fileprivate static var exceptionReported = false
 
     // MARK: - 安装
 
