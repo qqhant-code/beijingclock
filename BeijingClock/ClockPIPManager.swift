@@ -5,50 +5,44 @@ import CoreVideo
 import CoreMedia
 import CoreGraphics
 
-/// 画中画悬浮时钟管理器（严格对齐 zk 助手实测机制）。
+/// 画中画悬浮时钟管理器。
 ///
-/// 关键结论（反编译 zk IPA 确认 + 多轮真机实测）：
-/// 1) zk 跨 App 悬浮靠的是 AVPlayer + AVPlayerViewController + 系统 PiP。
-/// 2) iPhone 上裸 AVPictureInPictureController(playerLayer:) 的 isPictureInPicturePossible 通常 false，
-///    优先经由 AVPlayerViewController 托管的 PiP 启动。
-/// 3) AVPlayerViewController 的 pictureInPictureController 是懒加载的，present（animated）后 view 上屏、
-///    且 player 有有效 item 时才会创建。必须在 present 前就让 player 持有可播放 item。
-/// 4) zk 视频用 AVAssetExportSession 导出为 fast-start 标准 MP4（shouldOptimizeForNetworkUse）。
-/// 5) 必须给用户一个能随时退出全屏预览的关闭按钮，并禁用播放器默认手势，防止 PiP 失败时卡死。
+/// 采用 iOS 官方标准方案（对齐用户提供的阿里云/掘金资料）：
+/// 用 AVPlayer 播放一段“北京时间”视频，通过 AVPictureInPictureController(playerLayer:)
+/// 把画面投射成系统画中画小窗（iPhone 上唯一合法的真·跨 App 悬浮方式）。
+///
+/// 关键修正（对比前几版）：
+/// 1) 直接 AVPictureInPictureController(playerLayer:) 创建控制器，不再依赖
+///    AVPlayerViewController.pictureInPictureController 这个取不到的懒加载属性。
+/// 2) playerLayer 必须挂在一个真正可见、在窗口层级里的宿主 view 上，PiP 才可能 possible。
+/// 3) 视频用 Core Graphics 后台一次性批量生成，去掉在你设备上崩溃的 AVAssetExportSession。
+/// 4) 预览层始终带“悬浮窗 / 关闭”两个按钮，PiP 启动失败也不会卡死，可手动触发。
 final class ClockPIPManager: NSObject {
 
     static let shared = ClockPIPManager()
 
-    /// 视频帧尺寸：细长条，类似 zk 助手顶部条。宽:高 = 4:1。
+    /// 视频帧尺寸：细长条，宽:高 = 4:1。
     static let videoWidth: Int = 640
     static let videoHeight: Int = 160
 
-    /// 视频生成专用串行队列（绘制回主线程，当前后台线程等待，不会死锁）。
+    /// 视频生成专用串行队列。
     private let genQueue = DispatchQueue(label: "com.beijingclock.videogen")
 
     private var pipController: AVPictureInPictureController?
     private var player: AVPlayer?
-    private var playerVC: ClockPlayerViewController?
+    private var playerLayer: AVPlayerLayer?
+    private var hostView: UIView?
     private var itemObserver: NSKeyValueObservation?
-    private var pollingTimer: Timer?
+    private var pollTimer: Timer?
     private var regenTimer: Timer?
-    private var watchdogTimer: Timer?
-
-    /// present 是否已完成（viewDidAppear 后）。
-    private var presentDone = false
-    /// AVPlayerItem 是否已 readyToPlay。
-    private var itemReady = false
-    /// 是否已经尝试启动过 PiP（避免重复 start）。
-    private var triedStart = false
+    private var hintTimer: Timer?
 
     private var offset: TimeInterval = 0
     private var running = false
-    /// 当前已生成视频对应的“分钟”标识（yyyyMMddHHmm），用于检测是否需要重生成。
+    private var triedStart = false
     private var currentMinuteKey: String = ""
 
-    /// 用户是否要求运行（不等于 PiP 实际已显示，后者看 isPictureInPictureActive）
     private(set) var isRunning = false
-    /// PiP 窗口是否真正在屏幕上（系统回调更新）
     private(set) var isPictureInPictureActive = false
 
     private override init() {
@@ -78,45 +72,31 @@ final class ClockPIPManager: NSObject {
         self.offset = offset
         running = true
         isRunning = true
-        presentDone = false
-        itemReady = false
         triedStart = false
 
         setupAudioSession()
 
-        // 关键修复：在按钮点击事件（手势栈）内先生成视频，再 present，保证 AVPlayerViewController
-        // 呈现时 player 已经持有有效 item，系统才会懒加载 pictureInPictureController。
+        // 异步（快速）生成“当前分钟”视频，不阻塞按钮手势。
         let (minuteStart, key, currentSecond) = Self.currentBeijingMinuteInfo(offset: offset)
         currentMinuteKey = key
         CrashLogger.shared.log("ClockPIPManager 生成视频 for minute key=\(key) startAtSecond=\(currentSecond)")
 
-        var videoURL: URL?
-        let sem = DispatchSemaphore(value: 0)
         genQueue.async { [weak self] in
-            guard let self = self else {
-                sem.signal()
-                return
-            }
-            self.generateClockVideo(minuteStart: minuteStart) { url in
-                videoURL = url
-                sem.signal()
-            }
-        }
-        let waitResult = sem.wait(timeout: .now() + 3.0)
-        guard waitResult == .success, let url = videoURL else {
-            CrashLogger.shared.log("ClockPIPManager 视频生成超时或失败，无法启动 PiP")
-            running = false
-            isRunning = false
-            return
-        }
-
-        DispatchQueue.main.async { [weak self] in
             guard let self = self, self.running else { return }
-            let item = AVPlayerItem(url: url)
-            self.setupPlayerVC(with: item, startAtSecond: currentSecond)
-            self.startRegenTimer()
-            CrashLogger.shared.log("ClockPIPManager.start 完成")
+            self.generateClockVideo(minuteStart: minuteStart) { [weak self] url in
+                guard let self = self else { return }
+                guard let url = url else {
+                    CrashLogger.shared.log("ClockPIPManager 视频生成失败，无法启动 PiP")
+                    DispatchQueue.main.async { FloatingClockManager.shared.stop() }
+                    return
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self, self.running else { return }
+                    self.setupPlayerAndPiP(with: url, startAtSecond: currentSecond)
+                }
+            }
         }
+        startRegenTimer()
     }
 
     func stop() {
@@ -124,28 +104,21 @@ final class ClockPIPManager: NSObject {
         running = false
         isRunning = false
         isPictureInPictureActive = false
-        pollingTimer?.invalidate(); pollingTimer = nil
+        pollTimer?.invalidate(); pollTimer = nil
         regenTimer?.invalidate(); regenTimer = nil
-        watchdogTimer?.invalidate(); watchdogTimer = nil
+        hintTimer?.invalidate(); hintTimer = nil
         itemObserver?.invalidate(); itemObserver = nil
 
         pipController?.stopPictureInPicture()
         pipController?.delegate = nil
         pipController = nil
 
-        if let pvc = playerVC {
-            if pvc.presentingViewController != nil {
-                pvc.dismiss(animated: false, completion: nil)
-            }
-            pvc.willMove(toParent: nil)
-            pvc.view.removeFromSuperview()
-            pvc.removeFromParent()
-        }
-        playerVC = nil
+        removeHostView()
 
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
+        playerLayer = nil
 
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         CrashLogger.shared.log("ClockPIPManager.stop 完成")
@@ -153,7 +126,6 @@ final class ClockPIPManager: NSObject {
 
     func setOffset(_ offset: TimeInterval) {
         self.offset = offset
-        // 授时偏移变化后，立即按新偏移重建视频，让时钟马上对齐
         rebuildIfNeeded(force: true)
     }
 
@@ -162,7 +134,7 @@ final class ClockPIPManager: NSObject {
     private func setupAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setCategory(.playback, mode: .moviePlayback, options: [])
             try session.setActive(true)
             CrashLogger.shared.log("ClockPIPManager.setupAudioSession 成功")
         } catch {
@@ -183,135 +155,180 @@ final class ClockPIPManager: NSObject {
         }
     }
 
-    // MARK: - present AVPlayerViewController（手势栈内，携带有效 item）
+    // MARK: - 创建播放器 + 宿主视图 + 直接 PiP 控制器
 
-    private func setupPlayerVC(with item: AVPlayerItem, startAtSecond: Int) {
-        let player = AVPlayer(playerItem: item)
+    private func setupPlayerAndPiP(with url: URL, startAtSecond: Int) {
+        guard running else { return }
+
+        let player = AVPlayer(url: url)
         player.isMuted = true
         player.actionAtItemEnd = .none
         self.player = player
 
-        let pvc = ClockPlayerViewController()
-        pvc.player = player
-        pvc.showsPlaybackControls = false
-        pvc.allowsPictureInPicturePlayback = true
-        if #available(iOS 14.2, *) {
-            pvc.canStartPictureInPictureAutomaticallyFromInline = true
-        }
-        pvc.delegate = self
-        pvc.closeDelegate = self
-        pvc.view.backgroundColor = .clear
-        self.playerVC = pvc
-
-        guard let root = Self.topViewController() else {
-            CrashLogger.shared.log("ClockPIPManager 找不到可呈现的 VC，无法启动 PiP")
-            return
-        }
-        pvc.modalPresentationStyle = .overFullScreen
-        root.present(pvc, animated: true) { [weak self] in
-            guard let self = self, self.running else { return }
-            self.presentDone = true
-            CrashLogger.shared.log("ClockPIPManager present 完成（viewDidAppear）")
-            self.retrieveControllerWithRetry(attempt: 0)
-            self.tryStartPiP()
-        }
-        CrashLogger.shared.log("ClockPIPManager 已 present AVPlayerViewController（手势栈内，item 已就绪）")
-    }
-
-    /// 通过 Objective-C runtime 取出内部懒加载的 PiP controller（带重试）。
-    private func retrieveControllerWithRetry(attempt: Int) {
-        guard let pvc = playerVC else { return }
-        if let c = Self.obtainControllerOnce(from: pvc) {
-            pipController = c
-            pipController?.delegate = self
-            CrashLogger.shared.log("ClockPIPManager 已拿到 PiPController (runtime, 尝试 \(attempt))")
-            tryStartPiP()
-            return
-        }
-        if attempt < 10 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                guard let self = self, self.running else { return }
-                self.retrieveControllerWithRetry(attempt: attempt + 1)
-            }
-        } else {
-            CrashLogger.shared.log("ClockPIPManager 10 次重试仍未拿到 AVPlayerViewController 的 PiPController，尝试 playerLayer fallback")
-            setupPlayerLayerFallback()
-        }
-    }
-
-    /// 单次尝试取出 pictureInPictureController（perform/KVC，统一在 responds 守卫内，避免 KVC 抛异常）。
-    private static func obtainControllerOnce(from pvc: AVPlayerViewController) -> AVPictureInPictureController? {
-        let sel = NSSelectorFromString("pictureInPictureController")
-        guard pvc.responds(to: sel) else { return nil }
-        if let res = pvc.perform(sel) {
-            if let c = res.takeUnretainedValue() as? AVPictureInPictureController {
-                return c
-            }
-        }
-        if let c = pvc.value(forKey: "pictureInPictureController") as? AVPictureInPictureController {
-            return c
-        }
-        return nil
-    }
-
-    /// AVPlayerViewController 取不到 controller 时的兜底：用 AVPlayerLayer 直接创建 AVPictureInPictureController。
-    private func setupPlayerLayerFallback() {
-        guard let player = player else { return }
+        // 1) 宿主 view：放在主窗口根 VC 的视图上，真实可见，PiP 才 possible。
+        let host = makeHostView()
         let layer = AVPlayerLayer(player: player)
-        layer.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+        layer.frame = host.bounds
         layer.videoGravity = .resizeAspect
-        guard let controller = AVPictureInPictureController(playerLayer: layer) else {
-            CrashLogger.shared.log("ClockPIPManager playerLayer fallback 创建 PiPController 也失败")
-            failAndDismiss(reason: "无法创建 PiP 控制器")
+        layer.backgroundColor = UIColor.clear.cgColor
+        host.layer.insertSublayer(layer, at: 0)
+        self.playerLayer = layer
+        self.hostView = host
+
+        // 2) 直接创建 PiP 控制器（标准方案，不依赖 AVPlayerViewController 懒加载属性）。
+        guard let pip = AVPictureInPictureController(playerLayer: layer) else {
+            CrashLogger.shared.log("ClockPIPManager 创建 AVPictureInPictureController 失败（playerLayer）")
+            FloatingClockManager.shared.stop()
             return
         }
-        pipController = controller
-        pipController?.delegate = self
-        CrashLogger.shared.log("ClockPIPManager 已用 playerLayer fallback 创建 PiPController")
-        tryStartPiP()
+        pipController = pip
+        pip.delegate = self
+        CrashLogger.shared.log("ClockPIPManager 已创建 PiPController(playerLayer:)")
+
+        // 3) 观察播放状态，ready 后 seek + play，然后轮询 possible。
+        itemObserver?.invalidate()
+        itemObserver = player.currentItem?.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
+            guard let self = self else { return }
+            CrashLogger.shared.log("AVPlayerItem status=\(item.status.rawValue)")
+            if item.status == .readyToPlay {
+                let t = CMTime(value: Int64(startAtSecond), timescale: 1)
+                self.player?.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
+                self.player?.play()
+                CrashLogger.shared.log("AVPlayerItem readyToPlay，开始播放并尝试 PiP")
+                self.startPoll()
+            } else if item.status == .failed {
+                CrashLogger.shared.log("AVPlayerItem failed: \(item.error?.localizedDescription ?? "unknown")")
+            }
+        }
+
+        startPoll()
+        startHintTimer()
+        CrashLogger.shared.log("ClockPIPManager.setupPlayerAndPiP 完成")
     }
 
-    // MARK: - 生成“当前分钟”的时钟视频并启动
+    /// 创建可见的预览宿主 view（顶部细长条），并加上“悬浮窗 / 关闭”两个按钮。
+    private func makeHostView() -> UIView {
+        let screen = UIScreen.main.bounds
+        let w = min(screen.width - 40, 320)
+        let h = w / 4.0
+        let x = (screen.width - w) / 2
+        let y: CGFloat = 70
+        let host = UIView(frame: CGRect(x: x, y: y, width: w, height: h))
+        host.backgroundColor = UIColor.black.withAlphaComponent(0.001)
+        host.layer.cornerRadius = 14
+        host.layer.masksToBounds = true
+        host.isUserInteractionEnabled = true
 
-    private func buildVideoAndStart() {
-        let (minuteStart, key, currentSecond) = Self.currentBeijingMinuteInfo(offset: offset)
-        currentMinuteKey = key
-        CrashLogger.shared.log("ClockPIPManager 生成视频 for minute key=\(key) startAtSecond=\(currentSecond)")
-        genQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.generateClockVideo(minuteStart: minuteStart) { [weak self] url in
-                guard let self = self else { return }
-                DispatchQueue.main.async {
-                    guard self.running else { return }
-                    guard let url = url else {
-                        CrashLogger.shared.log("ClockPIPManager 生成视频失败，无法启动 PiP")
-                        return
-                    }
-                    let item = AVPlayerItem(url: url)
-                    self.player?.replaceCurrentItem(with: item)
-                    self.observeItemAndPlay(item: item, startAtSecond: currentSecond)
-                    CrashLogger.shared.log("ClockPIPManager 已设置 playerItem（fast-start 视频）")
-                }
+        // 悬浮窗按钮（用户手势内调用 startPictureInPicture，最可靠）
+        let floatBtn = UIButton(type: .system)
+        floatBtn.setTitle("悬浮窗", for: .normal)
+        floatBtn.setTitleColor(.white, for: .normal)
+        floatBtn.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+        floatBtn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.85)
+        floatBtn.layer.cornerRadius = 12
+        floatBtn.translatesAutoresizingMaskIntoConstraints = false
+        floatBtn.addTarget(self, action: #selector(floatTapped), for: .touchUpInside)
+        host.addSubview(floatBtn)
+
+        // 关闭按钮
+        let closeBtn = UIButton(type: .system)
+        closeBtn.setTitle("关闭", for: .normal)
+        closeBtn.setTitleColor(.white, for: .normal)
+        closeBtn.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+        closeBtn.backgroundColor = UIColor.systemRed.withAlphaComponent(0.85)
+        closeBtn.layer.cornerRadius = 12
+        closeBtn.translatesAutoresizingMaskToConstraints = false
+        closeBtn.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+        host.addSubview(closeBtn)
+
+        NSLayoutConstraint.activate([
+            floatBtn.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 10),
+            floatBtn.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -10),
+            floatBtn.widthAnchor.constraint(equalToConstant: 70),
+            floatBtn.heightAnchor.constraint(equalToConstant: 30),
+            closeBtn.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -10),
+            closeBtn.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -10),
+            closeBtn.widthAnchor.constraint(equalToConstant: 70),
+            closeBtn.heightAnchor.constraint(equalToConstant: 30)
+        ])
+
+        // 挂到主窗口根 VC 的 view 上（确保可见、在窗口层级里）
+        if let rootView = Self.rootView() {
+            rootView.addSubview(host)
+        }
+        return host
+    }
+
+    private func removeHostView() {
+        hostView?.removeFromSuperview()
+        hostView = nil
+        playerLayer?.removeFromSuperlayer()
+        playerLayer = nil
+    }
+
+    @objc private func floatTapped() {
+        CrashLogger.shared.log("用户点击“悬浮窗”按钮（手势内启动 PiP）")
+        guard let pip = pipController else { return }
+        if pip.isPictureInPicturePossible {
+            pip.startPictureInPicture()
+        } else {
+            CrashLogger.shared.log("PiP 尚未 possible，稍候自动重试")
+        }
+    }
+
+    @objc private func closeTapped() {
+        CrashLogger.shared.log("用户点击“关闭”按钮，停止")
+        FloatingClockManager.shared.stop()
+    }
+
+    // MARK: - 轮询 PiP 是否 possible
+
+    private func startPoll() {
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+            guard let self = self, self.running else { return }
+            guard let pip = self.pipController else { return }
+            let possible = pip.isPictureInPicturePossible
+            if possible && !self.triedStart {
+                self.triedStart = true
+                pip.startPictureInPicture()
+                CrashLogger.shared.log("PiP isPictureInPicturePossible=true，已自动 startPictureInPicture()")
             }
         }
     }
 
-    /// 每分钟交界重生成；force=true 用于授时偏移变化后立即重建。
+    /// 启动后若 6s 仍未进入 PiP，仅打日志提示（不再自动停止，避免卡死；用户可点“悬浮窗”按钮手动触发）。
+    private func startHintTimer() {
+        hintTimer?.invalidate()
+        hintTimer = Timer.scheduledTimer(withTimeInterval: 6, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            guard !self.isPictureInPictureActive else { return }
+            CrashLogger.shared.log("PiP 6s 内未自动接管：可点击预览上的“悬浮窗”按钮手动启动（iPhone 有时要求手势触发）")
+        }
+    }
+
+    // MARK: - 视频重生成
+
     private func rebuildIfNeeded(force: Bool) {
         let (minuteStart, key, _) = Self.currentBeijingMinuteInfo(offset: offset)
         if !force, key == currentMinuteKey { return }
         CrashLogger.shared.log("ClockPIPManager 重生成视频 (key \(currentMinuteKey) -> \(key), force=\(force))")
         currentMinuteKey = key
         genQueue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, self.running else { return }
             self.generateClockVideo(minuteStart: minuteStart) { [weak self] url in
                 guard let self = self else { return }
+                guard let url = url else { return }
                 DispatchQueue.main.async {
-                    guard self.running, let url = url else { return }
+                    guard self.running else { return }
                     let item = AVPlayerItem(url: url)
                     self.player?.replaceCurrentItem(with: item)
-                    self.observeItemAndPlay(item: item, startAtSecond: 0)
-                    CrashLogger.shared.log("ClockPIPManager 已替换 playerItem 为最新分钟")
+                    self.itemObserver?.invalidate()
+                    self.itemObserver = item.observe(\.status, options: [.new]) { [weak self] it, _ in
+                        guard let self = self, it.status == .readyToPlay else { return }
+                        self.player?.play()
+                        CrashLogger.shared.log("ClockPIPManager 已替换 playerItem 为最新分钟并开始播放")
+                    }
                 }
             }
         }
@@ -324,78 +341,17 @@ final class ClockPIPManager: NSObject {
         }
     }
 
-    private func observeItemAndPlay(item: AVPlayerItem, startAtSecond: Int) {
-        itemObserver?.invalidate()
-        itemReady = false
-        itemObserver = item.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
-            guard let self = self else { return }
-            CrashLogger.shared.log("AVPlayerItem status=\(item.status.rawValue)")
-            if item.status == .readyToPlay {
-                self.itemReady = true
-                let t = CMTime(value: Int64(startAtSecond), timescale: 1)
-                self.player?.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
-                self.player?.play()
-                CrashLogger.shared.log("AVPlayerItem readyToPlay，准备启动 PiP")
-                self.tryStartPiP()
-            } else if item.status == .failed {
-                CrashLogger.shared.log("AVPlayerItem failed: \(item.error?.localizedDescription ?? "unknown")")
-            }
-        }
-    }
-
-    /// 尝试启动 PiP：需要 controller + presentDone + itemReady 三者就绪。
-    /// 优先直接 startPictureInPicture()；若 isPictureInPicturePossible=false，则用 dismiss 触发系统自动 PiP。
-    private func tryStartPiP() {
-        guard let controller = pipController, presentDone, itemReady else {
-            CrashLogger.shared.log("tryStartPiP 跳过：controller/present/item 未就绪 (controller=\(pipController != nil), present=\(presentDone), item=\(itemReady))")
-            return
-        }
-        guard !triedStart else { return }
-        triedStart = true
-
-        let possible = controller.isPictureInPicturePossible
-        CrashLogger.shared.log("PiP isPictureInPicturePossible=\(possible)")
-
-        if possible {
-            controller.startPictureInPicture()
-            CrashLogger.shared.log("PiP startPictureInPicture() 已调用（直接启动）")
-        } else if let pvc = playerVC, pvc.presentingViewController != nil {
-            CrashLogger.shared.log("PiP possible=false，dismiss playerVC 触发系统自动 PiP")
-            pvc.dismiss(animated: false, completion: nil)
-        } else {
-            CrashLogger.shared.log("PiP possible=false 且 playerVC 未 present，无法触发")
-        }
-        startWatchdog()
-    }
-
-    /// 启动 watchdog：若 5s 内 PiP 仍未接管，则 dismiss 全屏、停止运行，避免卡住。
-    private func startWatchdog() {
-        watchdogTimer?.invalidate()
-        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
-            guard let self = self else { return }
-            guard !self.isPictureInPictureActive else { return }
-            CrashLogger.shared.log("PiP watchdog 5s 未接管，自动停止并恢复 App")
-            self.failAndDismiss(reason: "5 秒内未进入画中画，已自动停止")
-        }
-    }
-
-    private func failAndDismiss(reason: String) {
-        CrashLogger.shared.log("ClockPIPManager failAndDismiss: \(reason)")
-        FloatingClockManager.shared.stop()
-    }
-
     @objc private func itemDidPlayToEnd(_ notification: Notification) {
-        // 手动循环
         player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
-    // MARK: - 生成时钟视频（在 genQueue 后台执行；UIKit 绘制仍回主线程，但等待的是后台线程，不会死锁）
+    // MARK: - 生成时钟视频（Core Graphics 后台一次性批量画 60 帧）
 
     private func generateClockVideo(minuteStart: Date, completion: @escaping (URL?) -> Void) {
-        let rawURL = Self.cachesVideoRawURL()
-        try? FileManager.default.removeItem(at: rawURL)
+        let outURL = Self.cachesVideoURL()
+        try? FileManager.default.removeItem(at: outURL)
 
-        guard let writer = try? AVAssetWriter(outputURL: rawURL, fileType: .mp4) else {
+        guard let writer = try? AVAssetWriter(outputURL: outURL, fileType: .mp4) else {
             CrashLogger.shared.log("ClockPIPManager 创建 AVAssetWriter 失败")
             completion(nil)
             return
@@ -427,39 +383,46 @@ final class ClockPIPManager: NSObject {
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
 
+        // 在主线程一次性画出 60 帧（UIKit 绘制必须在主线程，但只往返一次，速度快）。
+        var buffers: [CVPixelBuffer] = []
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { sem.signal(); return }
+            for second in 0..<60 {
+                let fd = minuteStart.addingTimeInterval(TimeInterval(second))
+                let text = TimeSync.formatBeijingPrecise(fd)
+                if let pb = self.makeFrame(text: text) {
+                    buffers.append(pb)
+                }
+            }
+            sem.signal()
+        }
+        sem.wait()
+        guard buffers.count == 60 else {
+            CrashLogger.shared.log("ClockPIPManager 帧数不足（\(buffers.count)），生成失败")
+            writer.cancelWriting()
+            completion(nil)
+            return
+        }
+
         var frameTime = CMTime.zero
         let frameDuration = CMTime(value: 1, timescale: 1)
-        var success = true
-
-        for second in 0..<60 {
-            guard running else { success = false; break }
-            let frameDate = minuteStart.addingTimeInterval(TimeInterval(second))
-            let text = TimeSync.formatBeijingPrecise(frameDate)
-            var pb: CVPixelBuffer?
-            let sem = DispatchSemaphore(value: 0)
-            DispatchQueue.main.async {
-                pb = self.pixelBuffer(with: text)
-                sem.signal()
-            }
-            sem.wait()
-            guard let pb = pb else { success = false; break }
+        for pb in buffers {
             while !input.isReadyForMoreMediaData { usleep(2000) }
             if !adaptor.append(pb, withPresentationTime: frameTime) {
-                CrashLogger.shared.log("ClockPIPManager 写入第 \(second) 帧失败")
-                success = false
-                break
+                CrashLogger.shared.log("ClockPIPManager 写入帧失败")
+                writer.cancelWriting()
+                completion(nil)
+                return
             }
             frameTime = CMTimeAdd(frameTime, frameDuration)
         }
 
         input.markAsFinished()
         writer.finishWriting {
-            if success && writer.status == .completed {
-                CrashLogger.shared.log("ClockPIPManager 原始视频生成完成: \(rawURL.lastPathComponent)")
-                Self.exportFastStart(source: rawURL) { finalURL in
-                    CrashLogger.shared.log("ClockPIPManager 视频导出完成: \(finalURL?.lastPathComponent ?? "nil")")
-                    completion(finalURL)
-                }
+            if writer.status == .completed {
+                CrashLogger.shared.log("ClockPIPManager 视频生成完成: \(outURL.lastPathComponent)")
+                completion(outURL)
             } else {
                 CrashLogger.shared.log("ClockPIPManager 视频生成失败 status=\(writer.status.rawValue)")
                 completion(nil)
@@ -467,63 +430,11 @@ final class ClockPIPManager: NSObject {
         }
     }
 
-    /// 把 AVAssetWriter 产物用 AVAssetExportSession 重新导出为 fast-start MP4（moov 前置），
-    /// 这是 PiP 资格检查能认可的关键（zk 也用 AVAssetExportSession）。
-    private static func exportFastStart(source: URL, completion: @escaping (URL?) -> Void) {
-        let asset = AVAsset(url: source)
-        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
-            CrashLogger.shared.log("ClockPIPManager 创建 AVAssetExportSession 失败，使用原始文件")
-            completion(source)
-            return
-        }
-        let finalURL = Self.cachesVideoURL()
-        try? FileManager.default.removeItem(at: finalURL)
-        session.outputURL = finalURL
-        session.outputFileType = .mp4
-        session.shouldOptimizeForNetworkUse = true
-        session.exportAsynchronously {
-            if session.status == .completed {
-                completion(finalURL)
-            } else {
-                CrashLogger.shared.log("ClockPIPManager 导出失败 status=\(session.status.rawValue)，回退原始文件")
-                completion(source)
-            }
-        }
-    }
-
-    // MARK: - 把时钟文字画进 CVPixelBuffer（供视频帧使用）
-
-    private func pixelBuffer(with text: String) -> CVPixelBuffer? {
+    /// 用 Core Graphics 把时钟文字画进 CVPixelBuffer（后台主线程调用，无翻转变换）。
+    private func makeFrame(text: String) -> CVPixelBuffer? {
         let width = Self.videoWidth
         let height = Self.videoHeight
         let size = CGSize(width: width, height: height)
-
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1.0
-        format.opaque = true
-        let image = UIGraphicsImageRenderer(size: size, format: format).image { _ in
-            let barRect = CGRect(origin: .zero, size: size)
-            UIBezierPath(roundedRect: barRect, cornerRadius: 22).addClip()
-            UIColor(white: 0.05, alpha: 0.92).setFill()
-            UIRectFill(barRect)
-
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.alignment = .center
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.monospacedSystemFont(ofSize: 72, weight: .semibold),
-                .foregroundColor: UIColor.white,
-                .paragraphStyle: paragraph
-            ]
-            let attributed = NSAttributedString(string: text, attributes: attrs)
-            let textSize = attributed.boundingRect(with: size, options: .usesLineFragmentOrigin, context: nil).size
-            let textRect = CGRect(
-                x: (size.width - textSize.width) / 2,
-                y: (size.height - textSize.height) / 2,
-                width: textSize.width,
-                height: textSize.height
-            )
-            attributed.draw(in: textRect)
-        }
 
         let pixelAttrs: [String: Any] = [
             kCVPixelBufferCGImageCompatibilityKey as String: true,
@@ -546,8 +457,9 @@ final class ClockPIPManager: NSObject {
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
 
-        guard let context = CGContext(
-            data: CVPixelBufferGetBaseAddress(pixelBuffer),
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        guard let ctx = CGContext(
+            data: base,
             width: width,
             height: height,
             bitsPerComponent: 8,
@@ -558,7 +470,30 @@ final class ClockPIPManager: NSObject {
             CrashLogger.shared.log("ClockPIPManager 创建 CGContext 失败")
             return nil
         }
-        context.draw(image.cgImage!, in: CGRect(origin: .zero, size: size))
+
+        ctx.clear(CGRect(origin: .zero, size: size))
+        // 圆角深色背景
+        let path = CGPath(roundedRect: CGRect(origin: .zero, size: size),
+                          cornerWidth: 22, cornerHeight: 22, transform: nil)
+        ctx.addPath(path)
+        ctx.clip()
+        ctx.setFillColor(UIColor(white: 0.05, alpha: 0.92).cgColor)
+        ctx.fill(CGRect(origin: .zero, size: size))
+
+        // 文字
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.monospacedSystemFont(ofSize: 72, weight: .semibold),
+            .foregroundColor: UIColor.white
+        ]
+        let attrStr = NSAttributedString(string: text, attributes: attrs)
+        let textSize = attrStr.size()
+        let textRect = CGRect(
+            x: (size.width - textSize.width) / 2,
+            y: (size.height - textSize.height) / 2,
+            width: textSize.width,
+            height: textSize.height
+        )
+        (text as NSString).draw(in: textRect, withAttributes: attrs)
         return pixelBuffer
     }
 
@@ -583,76 +518,17 @@ final class ClockPIPManager: NSObject {
         return (minuteStart, key, comps.second ?? 0)
     }
 
-    static func topViewController() -> UIViewController? {
+    static func rootView() -> UIView? {
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return nil }
-        var vc = scene.windows.first?.rootViewController
-        while let presented = vc?.presentedViewController {
-            vc = presented
-        }
-        return vc
-    }
-
-    static func cachesVideoRawURL() -> URL {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        return dir.appendingPathComponent("clock_raw.mp4")
+        guard let root = scene.windows.first?.rootViewController else { return nil }
+        var vc: UIViewController? = root
+        while let presented = vc?.presentedViewController { vc = presented }
+        return vc?.view
     }
 
     static func cachesVideoURL() -> URL {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return dir.appendingPathComponent("clock_loop.mp4")
-    }
-}
-
-// MARK: - 自定义 AVPlayerViewController：关闭按钮 + 禁用默认手势
-
-protocol ClockPlayerViewControllerDelegate: AnyObject {
-    func playerViewControllerDidRequestClose(_ pvc: ClockPlayerViewController)
-}
-
-final class ClockPlayerViewController: AVPlayerViewController {
-    weak var closeDelegate: ClockPlayerViewControllerDelegate?
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        disableAllGestures(in: view)
-        addCloseButton()
-    }
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        disableAllGestures(in: view)
-    }
-
-    private func addCloseButton() {
-        let btn = UIButton(type: .system)
-        btn.setTitle("X", for: .normal)
-        btn.setTitleColor(.white, for: .normal)
-        btn.titleLabel?.font = UIFont.systemFont(ofSize: 18, weight: .bold)
-        btn.backgroundColor = UIColor.black.withAlphaComponent(0.5)
-        btn.layer.cornerRadius = 16
-        btn.layer.masksToBounds = true
-        btn.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
-        btn.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(btn)
-        NSLayoutConstraint.activate([
-            btn.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            btn.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            btn.widthAnchor.constraint(equalToConstant: 32),
-            btn.heightAnchor.constraint(equalToConstant: 32)
-        ])
-    }
-
-    private func disableAllGestures(in view: UIView) {
-        for gr in view.gestureRecognizers ?? [] {
-            gr.isEnabled = false
-        }
-        for sub in view.subviews {
-            disableAllGestures(in: sub)
-        }
-    }
-
-    @objc private func closeTapped() {
-        closeDelegate?.playerViewControllerDidRequestClose(self)
     }
 }
 
@@ -672,13 +548,10 @@ extension ClockPIPManager: AVPictureInPictureControllerDelegate {
         isPictureInPictureActive = true
         triedStart = true
         CrashLogger.shared.log("PiP 已开始显示（系统浮窗接管）")
-        watchdogTimer?.invalidate(); watchdogTimer = nil
-        if let pvc = playerVC, pvc.presentingViewController == nil {
-            pvc.willMove(toParent: nil)
-            pvc.view.removeFromSuperview()
-            pvc.removeFromParent()
-            playerVC = nil
-        }
+        pollTimer?.invalidate(); pollTimer = nil
+        hintTimer?.invalidate(); hintTimer = nil
+        // 隐藏预览宿主，系统 PiP 已接管；保留 player 继续播放。
+        hostView?.isHidden = true
         FloatingClockManager.shared.pipStateDidChange()
     }
 
@@ -688,6 +561,8 @@ extension ClockPIPManager: AVPictureInPictureControllerDelegate {
         isPictureInPictureActive = false
         CrashLogger.shared.log("PiP 已停止")
         FloatingClockManager.shared.pipStateDidChange()
+        // 用户关闭了 PiP，整体停止。
+        FloatingClockManager.shared.stop()
     }
 
     func pictureInPictureController(
@@ -696,30 +571,6 @@ extension ClockPIPManager: AVPictureInPictureControllerDelegate {
     ) {
         isPictureInPictureActive = false
         CrashLogger.shared.log("PiP 启动失败: \(error)")
-        watchdogTimer?.invalidate(); watchdogTimer = nil
         FloatingClockManager.shared.pipStateDidChange()
-    }
-}
-
-// MARK: - AVPlayerViewControllerDelegate
-
-extension ClockPIPManager: AVPlayerViewControllerDelegate {
-
-    func playerViewController(
-        _ playerViewController: AVPlayerViewController,
-        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
-    ) {
-        CrashLogger.shared.log("PiP restoreUserInterfaceForPictureInPictureStop")
-        completionHandler(true)
-    }
-}
-
-// MARK: - ClockPlayerViewControllerDelegate
-
-extension ClockPIPManager: ClockPlayerViewControllerDelegate {
-
-    func playerViewControllerDidRequestClose(_ pvc: ClockPlayerViewController) {
-        CrashLogger.shared.log("用户点击关闭按钮，停止 PiP")
-        FloatingClockManager.shared.stop()
     }
 }
