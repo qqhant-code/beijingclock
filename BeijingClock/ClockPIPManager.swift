@@ -516,16 +516,12 @@ final class ClockPIPManager: NSObject {
         let dataSize = Int(numSamples) * Int(bytesPerFrame)
         let zeros = [UInt8](repeating: 0, count: dataSize)
 
-        // 用 Data 保留字节，并让 block buffer 自己 copy/管理内存（blockAllocator = default）。
+        // 用 zeros 构造 block buffer；让 blockAllocator = default 负责 copy/管理内存。
         var blockBuffer: CMBlockBuffer?
-        var bbStatus: OSStatus = noErr
         zeros.withUnsafeBytes { rawBuffer in
-            guard let baseAddress = rawBuffer.baseAddress else {
-                bbStatus = OSStatus(kCMBlockBufferStructureAllocationFailedError)
-                return
-            }
+            guard let baseAddress = rawBuffer.baseAddress else { return }
             var bb: CMBlockBuffer?
-            bbStatus = CMBlockBufferCreateWithMemoryBlock(
+            let status = CMBlockBufferCreateWithMemoryBlock(
                 allocator: kCFAllocatorDefault,
                 memoryBlock: UnsafeMutableRawPointer(mutating: baseAddress),
                 blockLength: dataSize,
@@ -536,12 +532,12 @@ final class ClockPIPManager: NSObject {
                 flags: 0,
                 blockBufferOut: &bb
             )
-            blockBuffer = bb
+            if status == noErr { blockBuffer = bb }
         }
-        guard bbStatus == noErr, let blockBuffer = blockBuffer else { return nil }
+        guard let blockBuffer = blockBuffer else { return nil }
 
         var timing = CMSampleTimingInfo(
-            duration: CMTime(value: numSamples, timescale: CMTimeScale(sampleRate)),
+            duration: CMTime(value: CMTimeValue(numSamples), timescale: CMTimeScale(sampleRate)),
             presentationTimeStamp: presentationTime,
             decodeTimeStamp: CMTime.invalid
         )
