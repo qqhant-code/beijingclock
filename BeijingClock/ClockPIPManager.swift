@@ -11,11 +11,11 @@ import CoreGraphics
 /// 1) zk 跨 App 悬浮靠的是 AVPlayer + AVPlayerViewController + 系统 PiP。
 /// 2) iPhone 上裸 AVPictureInPictureController(playerLayer:) 的 isPictureInPicturePossible 永远 false，
 ///    只有经由 AVPlayerViewController 托管的 PiP 才被系统允许。
-/// 3) AVPlayerViewController 不需要全屏 present；把它的 view 挂在一个本 App 窗口层级里、
-///    可见（alpha=1，哪怕只有 4x4）的 host 上即可让系统认为 PiP 可用。
+/// 3) AVPlayerViewController 需要真正显示在一个 UIWindow 上，系统才会懒加载出
+///    pictureInPictureController。这里用 1x1 像素的独立 UIWindow 承载，既不可见也不遮挡 App。
 /// 4) 必须等 AVPlayerItem.status == .readyToPlay 后再去检查/启动 PiP，否则 possible 一直 false。
 /// 5) GitHub Actions 构建机 SDK 较旧，没有 AVPlayerViewController.pictureInPictureController 成员，
-///    故用 KVC（value(forKey:)）在运行时取出。
+///    故用 Objective-C runtime performSelector 在运行时取出。
 ///
 /// 实现：
 /// - 把“当前这一分钟”的北京时间渲染成 640x160 循环视频；
@@ -35,7 +35,7 @@ final class ClockPIPManager: NSObject {
     private var pipController: AVPictureInPictureController?
     private var player: AVPlayer?
     private var playerVC: AVPlayerViewController?
-    private var hostView: UIView?
+    private var pipWindow: UIWindow?
     private var itemObserver: NSKeyValueObservation?
     private var pollingTimer: Timer?
     private var regenTimer: Timer?
@@ -98,15 +98,16 @@ final class ClockPIPManager: NSObject {
         pipController?.delegate = nil
         pipController = nil
 
-        //  dismantle host / child VC
+        //  dismantle playerVC / window
         if let pvc = playerVC {
             pvc.willMove(toParent: nil)
             pvc.view.removeFromSuperview()
             pvc.removeFromParent()
         }
         playerVC = nil
-        hostView?.removeFromSuperview()
-        hostView = nil
+        pipWindow?.isHidden = true
+        pipWindow?.rootViewController = nil
+        pipWindow = nil
 
         player?.pause()
         player?.replaceCurrentItem(with: nil)
@@ -215,37 +216,46 @@ final class ClockPIPManager: NSObject {
         pvc.delegate = self
         self.playerVC = pvc
 
-        guard let root = Self.topViewController() else {
-            CrashLogger.shared.log("ClockPIPManager 找不到可呈现的 VC，无法启动 PiP")
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene else {
+            CrashLogger.shared.log("ClockPIPManager 取不到 UIWindowScene，无法启动 PiP")
             return
         }
 
-        // 建一个可见的 host，把 playerVC.view 挂进去（zk 分析里说的 4x4 host）。
-        // 必须可见(alpha=1)、在本 App 的 window 层级里，系统才会认为 PiP 可用。
-        let host = UIView(frame: CGRect(x: 0, y: 0, width: 4, height: 4))
-        host.backgroundColor = .clear
-        host.isUserInteractionEnabled = false
-        root.view.addSubview(host)
-        self.hostView = host
+        // 创建一个 1x1 像素的独立 UIWindow 承载 AVPlayerViewController。
+        // 必须真正显示在 window 层级里，系统才会懒加载 pictureInPictureController。
+        let pipWindow = UIWindow(windowScene: windowScene)
+        pipWindow.windowLevel = .alert + 1
+        pipWindow.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+        pipWindow.backgroundColor = .clear
+        pipWindow.isUserInteractionEnabled = false
+        pipWindow.rootViewController = pvc
+        pipWindow.makeKeyAndVisible()
+        self.pipWindow = pipWindow
 
-        root.addChild(pvc)
-        pvc.view.frame = host.bounds
-        pvc.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        host.addSubview(pvc.view)
-        pvc.didMove(toParent: root)
+        CrashLogger.shared.log("ClockPIPManager 已把 AVPlayerViewController 挂到 1x1 UIWindow")
 
-        CrashLogger.shared.log("ClockPIPManager 已把 AVPlayerViewController 挂到 host view")
-
-        // 用 KVC 取 pictureInPictureController（旧 SDK 无该属性声明，但运行时存在）
-        if let pip = pvc.value(forKey: "pictureInPictureController") as? AVPictureInPictureController {
+        // 用 Objective-C runtime 取 pictureInPictureController（旧 SDK 无该属性声明，但运行时存在）
+        self.pipController = Self.retrievePiPController(from: pvc)
+        if let pip = self.pipController {
             pip.delegate = self
-            self.pipController = pip
             CrashLogger.shared.log("ClockPIPManager 已拿到 PiPController (via AVPlayerViewController)")
         } else {
-            CrashLogger.shared.log("ClockPIPManager 取不到 pictureInPictureController（KVC 失败）")
+            CrashLogger.shared.log("ClockPIPManager 取不到 pictureInPictureController（runtime 取失败）")
         }
 
         observeItemAndPlay(item: item, startAtSecond: startAtSecond)
+    }
+
+    /// 通过 Objective-C runtime 取出 AVPlayerViewController 内部懒加载的 PiP controller。
+    private static func retrievePiPController(from pvc: AVPlayerViewController) -> AVPictureInPictureController? {
+        let sel = NSSelectorFromString("pictureInPictureController")
+        guard pvc.responds(to: sel) else {
+            CrashLogger.shared.log("retrievePiPController: AVPlayerViewController 不响应 pictureInPictureController")
+            return nil
+        }
+        let result = pvc.perform(sel)
+        let controller = result?.takeUnretainedValue() as? AVPictureInPictureController
+        return controller
     }
 
     private func observeItemAndPlay(item: AVPlayerItem, startAtSecond: Int) {
@@ -265,7 +275,7 @@ final class ClockPIPManager: NSObject {
         }
     }
 
-    /// 轮询 isPictureInPicturePossible：host 可见 + player ready + 播放后很快就会变 true，
+    /// 轮询 isPictureInPicturePossible：window 可见 + player ready + 播放后很快就会变 true，
     /// 一旦 true 立即 startPictureInPicture。
     private func startPictureInPictureWhenPossible() {
         pollingTimer?.invalidate()
@@ -288,11 +298,19 @@ final class ClockPIPManager: NSObject {
                 controller.startPictureInPicture()
             } else if elapsed >= 15 {
                 timer.invalidate(); self.pollingTimer = nil
-                CrashLogger.shared.log("PiP 15s 内仍不可启动， dismantle host（可能该设备/iOS 限制 PiP）")
-                self.hostView?.removeFromSuperview()
-                self.hostView = nil
+                CrashLogger.shared.log("PiP 15s 内仍不可启动，清理 window（可能该设备/iOS 限制 PiP）")
+                self.cleanupPiPWindow()
             }
         }
+    }
+
+    private func cleanupPiPWindow() {
+        pipWindow?.isHidden = true
+        pipWindow?.rootViewController = nil
+        pipWindow = nil
+        playerVC?.willMove(toParent: nil)
+        playerVC?.view.removeFromSuperview()
+        playerVC?.removeFromParent()
     }
 
     @objc private func itemDidPlayToEnd(_ notification: Notification) {
@@ -472,16 +490,6 @@ final class ClockPIPManager: NSObject {
         return (minuteStart, key, comps.second ?? 0)
     }
 
-    /// 找到当前最上层的 VC（用于挂 host view）
-    static func topViewController() -> UIViewController? {
-        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return nil }
-        var vc = scene.windows.first?.rootViewController
-        while let presented = vc?.presentedViewController {
-            vc = presented
-        }
-        return vc
-    }
-
     static func cachesVideoURL() -> URL {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return dir.appendingPathComponent("clock_loop.mp4")
@@ -503,9 +511,8 @@ extension ClockPIPManager: AVPictureInPictureControllerDelegate {
     ) {
         isPictureInPictureActive = true
         CrashLogger.shared.log("PiP 已开始显示")
-        // PiP 已接管播放，移除 host 以免遮挡 App
-        hostView?.removeFromSuperview()
-        hostView = nil
+        // PiP 已接管播放，隐藏承载 window 以免遮挡 App；保留 PiP 自身继续运行
+        pipWindow?.isHidden = true
         FloatingClockManager.shared.pipStateDidChange()
     }
 
@@ -523,8 +530,7 @@ extension ClockPIPManager: AVPictureInPictureControllerDelegate {
     ) {
         isPictureInPictureActive = false
         CrashLogger.shared.log("PiP 启动失败: \(error)")
-        hostView?.removeFromSuperview()
-        hostView = nil
+        cleanupPiPWindow()
         FloatingClockManager.shared.pipStateDidChange()
     }
 }
