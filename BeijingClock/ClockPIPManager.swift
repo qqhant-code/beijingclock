@@ -24,8 +24,11 @@ final class ClockPIPManager: NSObject {
     private var presentationTimeBase: CFTimeInterval = 0
 
     /// sample buffer 模式的 PiP 要求 layer 必须在一个可见的 view hierarchy 里，
-    /// 否则 startPictureInPicture() 不会调用任何 delegate。这里用一个 1x1 的隐藏宿主 view。
+    /// 否则 startPictureInPicture() 不会调用任何 delegate。这里用一个极小的宿主 view（alpha=1 + 透明背景，
+    /// 系统认为在屏幕上渲染、用户看不见）。
     private var hostView: UIView?
+    /// 轮询 isPictureInPicturePossible 的定时器
+    private var pipPollingTimer: Timer?
 
     /// 视频帧尺寸：细长条，类似 zk 助手顶部条。
     /// 宽度 > 高度，PiP 窗口会呈现为横向条。
@@ -73,6 +76,8 @@ final class ClockPIPManager: NSObject {
         presentationTimeBase = 0
         displayLink?.invalidate()
         displayLink = nil
+        pipPollingTimer?.invalidate()
+        pipPollingTimer = nil
 
         pipController?.stopPictureInPicture()
         pipController = nil
@@ -131,18 +136,21 @@ final class ClockPIPManager: NSObject {
             return
         }
 
-        // 1) 准备一个**可见**的 host view（极小、几乎透明），把 sample buffer layer 挂上去。
-        //    sample buffer 模式的 PiP 要求 layer 实际在屏幕上渲染内容，hidden 状态不会触发任何回调。
+        // 1) 准备一个**可见**的 host view（极小、alpha=1 但背景透明），把 sample buffer layer 挂上去。
+        //    关键：sample buffer 模式的 PiP 会检查 layer 是否“在屏幕上渲染出可见内容”。
+        //    若 host.alpha 设成 0.001 或 isHidden=true，合成器判定为不可见 -> 系统既不调用缓冲回调、
+        //    也不允许启动 PiP。这里用 alpha=1 + 透明背景，系统视为可见、用户看不见。
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
               let keyWindow = scene.windows.first else {
             CrashLogger.shared.log("ClockPIPManager 找不到 keyWindow，无法启动 PiP")
             return
         }
-        let host = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 4, height: 4))
         host.backgroundColor = .clear
         host.isUserInteractionEnabled = false
-        host.isHidden = false          // 必须可见，否则 PiP 认为没有内容在播放
-        host.alpha = 0.001             // 几乎全透明，用户看不到
+        host.isHidden = false          // 必须非 hidden
+        host.alpha = 1.0               // 必须 alpha=1，否则被判定为不可见内容
+        host.clipsToBounds = true
         keyWindow.addSubview(host)
         self.hostView = host
 
@@ -152,7 +160,7 @@ final class ClockPIPManager: NSObject {
         host.layer.addSublayer(layer)
         self.sampleBufferDisplayLayer = layer
 
-        CrashLogger.shared.log("ClockPIPManager 已把 sampleBufferDisplayLayer 加入 view hierarchy (host visible)")
+        CrashLogger.shared.log("ClockPIPManager 已把 sampleBufferDisplayLayer 加入 view hierarchy (host alpha=1 clear)")
 
         // 2) 创建 PiP controller
         let contentSource = AVPictureInPictureController.ContentSource(
@@ -167,15 +175,35 @@ final class ClockPIPManager: NSObject {
 
         CrashLogger.shared.log("ClockPIPManager 已创建 PiPController")
 
-        // 3) 先喂一帧，再启动 PiP，给系统一个可渲染的内容
+        // 3) 先喂一帧，然后轮询 isPictureInPicturePossible（系统需要时间缓冲并回调 shouldProcede...），
+        //    一旦变为 true 立即 startPictureInPicture。
         renderFrame()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        startPictureInPictureWhenPossible()
+    }
+
+    /// 轮询 isPictureInPicturePossible：sample buffer PiP 不是创建完立刻就能启动，
+    /// 系统要先缓冲帧并调用 shouldProcedeToPlayAfterApplyingBufferingHint，状态才翻 true。
+    /// 这里每 0.3s 查一次，最多查 15s。
+    private func startPictureInPictureWhenPossible() {
+        pipPollingTimer?.invalidate()
+        var elapsed: TimeInterval = 0
+        let interval: TimeInterval = 0.3
+        pipPollingTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
+            elapsed += interval
+            guard let controller = self.pipController else {
+                timer.invalidate(); self?.pipPollingTimer = nil; return
+            }
             let possible = controller.isPictureInPicturePossible
-            CrashLogger.shared.log("PiP isPictureInPicturePossible=\(possible)，调用 startPictureInPicture")
+            let layerStatus = self.sampleBufferDisplayLayer?.status.rawValue ?? -1
+            CrashLogger.shared.log("PiP 轮询 isPictureInPicturePossible=\(possible) layerStatus=\(layerStatus) elapsed=\(String(format: "%.1f", elapsed))s")
             if possible {
+                timer.invalidate(); self?.pipPollingTimer = nil
+                CrashLogger.shared.log("PiP possible=true，调用 startPictureInPicture")
                 controller.startPictureInPicture()
-            } else {
-                CrashLogger.shared.log("PiP 仍不可启动，可能 delegate 未实现必需的 shouldProcedeToPlayAfterApplyingBufferingHint")
+            } else if elapsed >= 15 {
+                timer.invalidate(); self?.pipPollingTimer = nil
+                CrashLogger.shared.log("PiP 15s 内仍不可启动，停止轮询（请检查 layerStatus / 缓冲回调）")
             }
         }
     }
@@ -193,11 +221,19 @@ final class ClockPIPManager: NSObject {
         let now = Date().addingTimeInterval(offset)
         let text = TimeSync.formatBeijingPrecise(now)
         guard let sampleBuffer = createSampleBuffer(with: text) else {
-            CrashLogger.shared.log("ClockPIPManager.renderFrame 生成 sampleBuffer 失败")
             return
         }
-        sampleBufferDisplayLayer?.enqueue(sampleBuffer)
-        sampleBufferDisplayLayer?.setNeedsDisplay()
+        guard let layer = sampleBufferDisplayLayer else { return }
+        // 注意：AVSampleBufferDisplayLayer 靠 enqueue 的 sample buffer 自动渲染，
+        // 不要调用 setNeedsDisplay()（那会用 layer.contents 重绘，可能清掉已入队帧）。
+        let ok = layer.enqueue(sampleBuffer)
+        if !ok {
+            if layer.status == .failed {
+                CrashLogger.shared.log("ClockPIPManager enqueue 失败 status=failed error=\(String(describing: layer.error))")
+            } else {
+                // 队列偶尔满（15fps 下少见），忽略即可
+            }
+        }
     }
 
     // MARK: - 把时钟文字渲染成 CMSampleBuffer
@@ -396,6 +432,7 @@ extension ClockPIPManager: AVPictureInPictureSampleBufferPlaybackDelegate {
     func pictureInPictureControllerShouldProcedeToPlayAfterApplyingBufferingHint(
         _ pictureInPictureController: AVPictureInPictureController
     ) -> Bool {
+        CrashLogger.shared.log("PiP bufferingHint delegate 被调用，返回 true")
         return true
     }
 }
