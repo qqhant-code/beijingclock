@@ -3,26 +3,17 @@ import Darwin
 
 /// 轻量崩溃/运行日志：闪退时把异常与调用栈写入沙盒文件，
 /// 下次启动由 App 界面直接展示，相当于"iOS 版 logcat + 崩溃报告"。
-///
-/// 关键修复：
-/// - NSException 会先被 exceptionHandler 抓住并写入"异常报告"，
-///   随后系统 abort() 又触发 SIGABRT；信号处理器发现"异常报告已存在"
-///   就**不再覆盖**，保留最有价值的堆栈。
-/// - 用 dladdr 把地址符号化成 函数名+偏移，配合构建时保留符号表，
-///   能直接看到是哪个 Swift 函数崩溃。
 final class CrashLogger {
 
     static let shared = CrashLogger()
 
-    private let crashURL: URL? = {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-            .first?.appendingPathComponent("crash.log")
+    /// 日志目录改为 Library/Caches 更稳定，且不会被 iCloud 同步。
+    private lazy var logDir: URL? = {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
     }()
 
-    private let logURL: URL? = {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
-            .first?.appendingPathComponent("app.log")
-    }()
+    private var crashURL: URL? { logDir?.appendingPathComponent("crash.log") }
+    private var logURL: URL? { logDir?.appendingPathComponent("app.log") }
 
     private let q = DispatchQueue(label: "crashlogger")
 
@@ -32,11 +23,13 @@ final class CrashLogger {
     // MARK: - 安装
 
     func setup() {
+        ensureLogFileExists()
         // 必须是"非捕获上下文"的函数才能转成 C 函数指针（signal/异常系统要求）。
         NSSetUncaughtExceptionHandler(exceptionHandler)
         for sig in [SIGABRT, SIGILL, SIGSEGV, SIGBUS, SIGTRAP, SIGFPE] {
             signal(sig, bcSignalHandler)
         }
+        log("App 启动，崩溃捕获器已安装")
     }
 
     // MARK: - 运行日志（类 logcat）
@@ -45,19 +38,57 @@ final class CrashLogger {
         guard let url = logURL else { return }
         let line = "[\(Self.ts())] \(msg)\n"
         q.async {
-            if let fh = try? FileHandle(forWritingTo: url) {
-                fh.seekToEndOfFile()
-                fh.write(line.data(using: .utf8) ?? Data())
-                try? fh.closeFile()
+            self.appendLine(line, to: url)
+        }
+    }
+
+    /// 同步写入关键日志，用于 setup 等需要立即落盘的场景。
+    func logSync(_ msg: String) {
+        guard let url = logURL else { return }
+        let line = "[\(Self.ts())] \(msg)\n"
+        appendLine(line, to: url)
+    }
+
+    private func appendLine(_ line: String, to url: URL) {
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil, attributes: nil)
+        }
+        guard let data = line.data(using: .utf8),
+              let fh = try? FileHandle(forWritingTo: url) else {
+            // 兜底：直接覆盖写
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+            return
+        }
+        defer { try? fh.close() }
+        do {
+            if #available(iOS 13.4, *) {
+                try fh.seekToEnd()
+                try fh.write(contentsOf: data)
             } else {
-                try? line.write(to: url, atomically: true, encoding: .utf8)
+                fh.seekToEndOfFile()
+                fh.write(data)
             }
+        } catch {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func ensureLogFileExists() {
+        guard let url = logURL else { return }
+        if !FileManager.default.fileExists(atPath: url.path) {
+            FileManager.default.createFile(atPath: url.path, contents: nil, attributes: nil)
+        }
+        guard let crash = crashURL else { return }
+        if !FileManager.default.fileExists(atPath: crash.path) {
+            FileManager.default.createFile(atPath: crash.path, contents: nil, attributes: nil)
         }
     }
 
     func lastLog() -> String? {
-        guard let url = logURL else { return nil }
-        return try? String(contentsOf: url, encoding: .utf8)
+        guard let url = logURL,
+              let s = try? String(contentsOf: url, encoding: .utf8),
+              !s.isEmpty else { return nil }
+        return s
     }
 
     // MARK: - 崩溃日志

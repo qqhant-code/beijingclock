@@ -20,6 +20,10 @@ targets:
           - Info.plist
     dependencies:
       - sdk: AVFoundation.framework
+      - sdk: AVKit.framework
       - sdk: CoreLocation.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreImage.framework
+      - sdk: CoreGraphics.framework
     info:
       path: BeijingClock/Info.plist

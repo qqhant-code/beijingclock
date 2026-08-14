@@ -3,14 +3,23 @@ import UIKit
 
 struct ContentView: View {
 
-    @State private var running = false
     @State private var status = "校时中…"
     @State private var lastSync = ""
-    @State private var floating = false
     @State private var lastError: String?
     @State private var crashText: String?
     @State private var logText = ""
     @State private var showLog = false
+
+    /// 刷新触发器：每次收到状态通知时 + 每秒主动刷新一次，保证按钮状态始终与 manager 同步。
+    @State private var refreshTick = 0
+
+    private var isRunning: Bool {
+        FloatingClockManager.shared.isRunning
+    }
+
+    private var isFloating: Bool {
+        ClockPIPManager.shared.isPictureInPictureActive
+    }
 
     var body: some View {
         ZStack {
@@ -23,7 +32,7 @@ struct ContentView: View {
                 // 崩溃日志（闪退后下次进入会显示，等效崩溃报告）
                 if let crash = crashText {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("⚠️ 检测到上次闪退，点下面复制发我")
+                        Text("检测到上次闪退，点下面复制发我")
                             .foregroundColor(.red)
                             .font(.caption)
                         ScrollView(.vertical, showsIndicators: true) {
@@ -54,8 +63,8 @@ struct ContentView: View {
                 }
 
                 VStack(spacing: 6) {
-                    Text("开启后，时钟以悬浮窗形式盖在所有 App 上方")
-                    Text("秒级跳动 · 不受系统时间影响 · 后台持续运行")
+                    Text("开启后，时钟以系统画中画悬浮在所有 App 上方")
+                    Text("秒级跳动 · 不受系统时间影响 · 切 App 仍可显示")
                 }
                 .font(.caption)
                 .foregroundColor(.gray)
@@ -75,10 +84,10 @@ struct ContentView: View {
                 // 悬浮窗状态
                 VStack(spacing: 4) {
                     HStack(spacing: 6) {
-                        Image(systemName: floating ? "rectangle.on.rectangle" : "rectangle.dashed")
-                            .foregroundColor(floating ? .green : (lastError == nil ? .gray : .red))
-                        Text(floating ? "悬浮窗运行中" : (lastError == nil ? "悬浮窗未开启" : "悬浮窗未开启"))
-                            .foregroundColor(lastError == nil ? .gray : .red)
+                        Image(systemName: isFloating ? "rectangle.on.rectangle" : "rectangle.dashed")
+                            .foregroundColor(isFloating ? .green : .gray)
+                        Text(isFloating ? "画中画时钟已显示" : (isRunning ? "画中画启动中…" : "画中画未开启"))
+                            .foregroundColor(isFloating ? .green : .gray)
                             .font(.caption)
                     }
                     if let err = lastError {
@@ -91,21 +100,21 @@ struct ContentView: View {
                 }
 
                 Button(action: toggle) {
-                    Text(running ? "关闭悬浮时钟" : "开启悬浮时钟")
+                    Text(isRunning ? "关闭悬浮时钟" : "开启悬浮时钟")
                         .padding(.horizontal, 26).padding(.vertical, 11)
-                        .background(running ? Color.red.opacity(0.18) : Color.cyan.opacity(0.15))
-                        .foregroundColor(running ? .red : .cyan)
+                        .background(isRunning ? Color.red.opacity(0.18) : Color.cyan.opacity(0.15))
+                        .foregroundColor(isRunning ? .red : .cyan)
                         .clipShape(Capsule())
                 }
 
-                if running {
-                    Text("提示：悬浮条可拖动；点右侧 ✕ 关闭。切到别的 App 后它仍会显示。")
+                if isRunning || isFloating {
+                    Text("提示：画中画窗口可拖动到任意角落，点窗口上的 ✕ 也可关闭。")
                         .font(.caption2)
                         .foregroundColor(.gray)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 36)
 
-                    Button("增强保活(定位，仿 zk 双保活)") {
+                    Button("增强保活(定位)") {
                         FloatingClockManager.shared.enableLocationKeepAlive()
                     }
                     .foregroundColor(.orange)
@@ -146,17 +155,25 @@ struct ContentView: View {
         .onAppear {
             crashText = CrashLogger.shared.lastCrash()
             resync()
-            FloatingClockManager.shared.updateTime()
+            startRefreshTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: FloatingClockManager.pipStateNotification)) { _ in
-            running = FloatingClockManager.shared.isRunning
-            floating = FloatingClockManager.shared.floating
+            refreshTick += 1
+        }
+        .onChange(of: refreshTick) { _ in
             lastError = FloatingClockManager.shared.lastError
         }
     }
 
+    /// 每秒主动刷新一次 UI，防止通知漏发导致按钮状态与实际不一致。
+    private func startRefreshTimer() {
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.refreshTick += 1
+        }
+    }
+
     private func toggle() {
-        if FloatingClockManager.shared.isRunning {
+        if isRunning {
             FloatingClockManager.shared.stop()
         } else {
             resync {
