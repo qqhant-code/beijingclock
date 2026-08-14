@@ -192,17 +192,17 @@ final class ClockPIPManager: NSObject {
             guard let self = self else { timer.invalidate(); return }
             elapsed += interval
             guard let controller = self.pipController else {
-                timer.invalidate(); self?.pipPollingTimer = nil; return
+                timer.invalidate(); self.pipPollingTimer = nil; return
             }
             let possible = controller.isPictureInPicturePossible
             let layerStatus = self.sampleBufferDisplayLayer?.status.rawValue ?? -1
             CrashLogger.shared.log("PiP 轮询 isPictureInPicturePossible=\(possible) layerStatus=\(layerStatus) elapsed=\(String(format: "%.1f", elapsed))s")
             if possible {
-                timer.invalidate(); self?.pipPollingTimer = nil
+                timer.invalidate(); self.pipPollingTimer = nil
                 CrashLogger.shared.log("PiP possible=true，调用 startPictureInPicture")
                 controller.startPictureInPicture()
             } else if elapsed >= 15 {
-                timer.invalidate(); self?.pipPollingTimer = nil
+                timer.invalidate(); self.pipPollingTimer = nil
                 CrashLogger.shared.log("PiP 15s 内仍不可启动，停止轮询（请检查 layerStatus / 缓冲回调）")
             }
         }
@@ -226,13 +226,10 @@ final class ClockPIPManager: NSObject {
         guard let layer = sampleBufferDisplayLayer else { return }
         // 注意：AVSampleBufferDisplayLayer 靠 enqueue 的 sample buffer 自动渲染，
         // 不要调用 setNeedsDisplay()（那会用 layer.contents 重绘，可能清掉已入队帧）。
-        let ok = layer.enqueue(sampleBuffer)
-        if !ok {
-            if layer.status == .failed {
-                CrashLogger.shared.log("ClockPIPManager enqueue 失败 status=failed error=\(String(describing: layer.error))")
-            } else {
-                // 队列偶尔满（15fps 下少见），忽略即可
-            }
+        // 注意：该 SDK 下 enqueue(_:) 返回 Void，不捕获返回值；用 layer.status 判断是否正常。
+        layer.enqueue(sampleBuffer)
+        if layer.status == .failed {
+            CrashLogger.shared.log("ClockPIPManager layer.status=failed error=\(String(describing: layer.error))")
         }
     }
 
