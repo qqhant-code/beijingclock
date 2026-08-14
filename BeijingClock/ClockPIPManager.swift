@@ -226,7 +226,7 @@ final class ClockPIPManager: NSObject {
         floatBtn.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
         floatBtn.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.85)
         floatBtn.layer.cornerRadius = 12
-        floatBtn.translatesAutoresizingMaskIntoConstraints = false
+        floatBtn.frame = CGRect(x: 10, y: host.bounds.height - 40, width: 70, height: 30)
         floatBtn.addTarget(self, action: #selector(floatTapped), for: .touchUpInside)
         host.addSubview(floatBtn)
 
@@ -237,20 +237,9 @@ final class ClockPIPManager: NSObject {
         closeBtn.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
         closeBtn.backgroundColor = UIColor.systemRed.withAlphaComponent(0.85)
         closeBtn.layer.cornerRadius = 12
-        closeBtn.translatesAutoresizingMaskToConstraints = false
+        closeBtn.frame = CGRect(x: host.bounds.width - 80, y: host.bounds.height - 40, width: 70, height: 30)
         closeBtn.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
         host.addSubview(closeBtn)
-
-        NSLayoutConstraint.activate([
-            floatBtn.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 10),
-            floatBtn.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -10),
-            floatBtn.widthAnchor.constraint(equalToConstant: 70),
-            floatBtn.heightAnchor.constraint(equalToConstant: 30),
-            closeBtn.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -10),
-            closeBtn.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -10),
-            closeBtn.widthAnchor.constraint(equalToConstant: 70),
-            closeBtn.heightAnchor.constraint(equalToConstant: 30)
-        ])
 
         // 挂到主窗口根 VC 的 view 上（确保可见、在窗口层级里）
         if let rootView = Self.rootView() {
