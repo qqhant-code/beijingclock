@@ -23,6 +23,13 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
     private override init() {
         super.init()
         locationManager.delegate = self
+        let nc = NotificationCenter.default
+        nc.addObserver(self, selector: #selector(appDidEnterBackground),
+                       name: UIApplication.didEnterBackgroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(appWillEnterForeground),
+                       name: UIApplication.willEnterForegroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(audioSessionInterrupted(_:)),
+                       name: AVAudioSession.interruptionNotification, object: nil)
     }
     private var pumpTimer: Timer?
     private var resyncTimer: Timer?
@@ -78,13 +85,13 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
 
         updateTime()
         startPump()
-        CrashLogger.shared.log("start() 悬浮窗已显示，准备延迟启动音频")
 
-        // 2) 静音音频保活延迟 0.4s 启动（若此处崩溃，说明问题在音频而非窗口）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            CrashLogger.shared.log("start() 延迟启动 startSilentAudio")
-            self?.startSilentAudio()
-        }
+        // 2) 立即启动静音音频保活（约束崩溃已定位修复，不再需要延迟）
+        CrashLogger.shared.log("start() 立即启动音频保活")
+        startSilentAudio()
+
+        // 若用户已授权定位，自动开启双保活（与 zk 助手一致）
+        startLocationUpdatesIfAuthorized()
 
         // 每 5 分钟重新校时一次
         resyncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
@@ -98,7 +105,10 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         pumpTimer?.invalidate(); pumpTimer = nil
         resyncTimer?.invalidate(); resyncTimer = nil
         stopSilentAudio()
+        locationManager.stopUpdatingLocation()
+        locationKeepAlive = false
         FloatingClockWindow.shared?.hideFloating()
+        FloatingClockWindow.shared = nil   // 必须清掉，否则下次 start 只 show 不重启定时器/音频
         floating = false
         running = false
         postState()
@@ -132,8 +142,8 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         CrashLogger.shared.log("startSilentAudio 进入")
         do {
             let sess = AVAudioSession.sharedInstance()
-            try sess.setCategory(.playback, mode: .default,
-                                 options: [.mixWithOthers, .duckOthers])
+            // 只混音，不 duck，避免被系统或其它 App 的行为中断
+            try sess.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try sess.setActive(true)
             CrashLogger.shared.log("startSilentAudio AVAudioSession.setActive 成功")
         } catch {
@@ -163,12 +173,13 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    /// 生成一段极短的静音 16-bit PCM WAV（约 0.1 秒），避免打包外部音频文件。
+    /// 生成一段 5 秒静音 16-bit PCM WAV，避免打包外部音频文件。
+    /// 比 0.1 秒更不易被系统判定为"空闲/已结束"，后台保活更稳。
     private static func makeSilentWav() -> Data? {
         let sampleRate: UInt32 = 8000
         let numChannels: UInt16 = 1
         let bitsPerSample: UInt16 = 16
-        let numSamples: UInt32 = sampleRate / 10
+        let numSamples: UInt32 = sampleRate * 5
         let blockAlign = numChannels * (bitsPerSample / 8)
         let byteRate = sampleRate * UInt32(blockAlign)
         let dataSize = numSamples * UInt32(blockAlign)
@@ -207,6 +218,42 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
         locationManager.distanceFilter = CLLocationDistanceMax
         locationManager.startUpdatingLocation()
         locationKeepAlive = true
+    }
+
+    private func startLocationUpdatesIfAuthorized() {
+        let status = locationManager.authorizationStatus
+        guard status == .authorizedWhenInUse || status == .authorizedAlways else { return }
+        startLocationUpdates()
+    }
+
+    // MARK: - 前后台 & 音频中断恢复
+
+    @objc private func appDidEnterBackground() {
+        CrashLogger.shared.log("进入后台，恢复音频保活")
+        guard running else { return }
+        startSilentAudio()
+    }
+
+    @objc private func appWillEnterForeground() {
+        CrashLogger.shared.log("回到前台，恢复音频保活")
+        guard running else { return }
+        startSilentAudio()
+    }
+
+    @objc private func audioSessionInterrupted(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeRaw = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else { return }
+        if type == .began {
+            CrashLogger.shared.log("音频会话被中断")
+        } else if type == .ended {
+            if let optionRaw = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt,
+               AVAudioSession.InterruptionOptions(rawValue: optionRaw).contains(.shouldResume) {
+                CrashLogger.shared.log("音频中断结束，尝试恢复")
+                guard running else { return }
+                startSilentAudio()
+            }
+        }
     }
 
     // MARK: - CLLocationManagerDelegate
