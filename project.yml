@@ -21,6 +21,7 @@ targets:
     dependencies:
       - sdk: AVFoundation.framework
       - sdk: AVKit.framework
+      - sdk: AudioToolbox.framework
       - sdk: CoreLocation.framework
       - sdk: CoreVideo.framework
       - sdk: CoreImage.framework
