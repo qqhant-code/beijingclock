@@ -20,6 +20,8 @@ final class ClockPIPManager: NSObject {
     private var displayLink: CADisplayLink?
     private var offset: TimeInterval = 0
     private var running = false
+    /// sample buffer 的 presentationTimeStamp 基准：第一帧记为 0，之后单调递增。
+    private var presentationTimeBase: CFTimeInterval = 0
 
     /// sample buffer 模式的 PiP 要求 layer 必须在一个可见的 view hierarchy 里，
     /// 否则 startPictureInPicture() 不会调用任何 delegate。这里用一个 1x1 的隐藏宿主 view。
@@ -68,6 +70,7 @@ final class ClockPIPManager: NSObject {
         CrashLogger.shared.log("ClockPIPManager.stop 进入")
         running = false
         isRunning = false
+        presentationTimeBase = 0
         displayLink?.invalidate()
         displayLink = nil
 
@@ -166,10 +169,14 @@ final class ClockPIPManager: NSObject {
 
         // 3) 先喂一帧，再启动 PiP，给系统一个可渲染的内容
         renderFrame()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             let possible = controller.isPictureInPicturePossible
             CrashLogger.shared.log("PiP isPictureInPicturePossible=\(possible)，调用 startPictureInPicture")
-            controller.startPictureInPicture()
+            if possible {
+                controller.startPictureInPicture()
+            } else {
+                CrashLogger.shared.log("PiP 仍不可启动，可能 delegate 未实现必需的 shouldProcedeToPlayAfterApplyingBufferingHint")
+            }
         }
     }
 
@@ -190,6 +197,7 @@ final class ClockPIPManager: NSObject {
             return
         }
         sampleBufferDisplayLayer?.enqueue(sampleBuffer)
+        sampleBufferDisplayLayer?.setNeedsDisplay()
     }
 
     // MARK: - 把时钟文字渲染成 CMSampleBuffer
@@ -281,9 +289,12 @@ final class ClockPIPManager: NSObject {
         }
 
         var sampleBuffer: CMSampleBuffer?
+        // presentationTimeStamp 从 0 开始单调递增，配合 timeRange [0, +inf) 让 PiP 播放控制稳定。
+        if presentationTimeBase == 0 { presentationTimeBase = CACurrentMediaTime() }
+        let ptsSeconds = CACurrentMediaTime() - presentationTimeBase
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 15),
-            presentationTimeStamp: CMTimeMakeWithSeconds(CACurrentMediaTime(), preferredTimescale: 1000),
+            presentationTimeStamp: CMTime(seconds: ptsSeconds, preferredTimescale: 600),
             decodeTimeStamp: CMTime.invalid
         )
         let sbStatus = CMSampleBufferCreateReadyWithImageBuffer(
@@ -378,5 +389,13 @@ extension ClockPIPManager: AVPictureInPictureSampleBufferPlaybackDelegate {
         completion: @escaping () -> Void
     ) {
         completion()
+    }
+
+    // 必需（很多人漏掉）：PiP 在缓冲后询问是否继续播放。必须返回 true，
+    // 否则系统判定"不可进入 PiP"，isPictureInPicturePossible 一直为 false，start 无回调。
+    func pictureInPictureControllerShouldProcedeToPlayAfterApplyingBufferingHint(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) -> Bool {
+        return true
     }
 }
