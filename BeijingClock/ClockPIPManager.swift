@@ -295,6 +295,29 @@ extension ClockPIPManager: AVPictureInPictureControllerDelegate {
 
 extension ClockPIPManager: AVPictureInPictureSampleBufferPlaybackDelegate {
 
+    // 必需：告诉 PiP 当前可播放的时间范围。时钟是实时流，返回无限范围。
+    func pictureInPictureControllerTimeRangeForPlayback(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) -> CMTimeRange {
+        return CMTimeRange(start: .zero, end: .positiveInfinity)
+    }
+
+    // 必需：告诉 PiP 当前是否处于暂停状态。时钟永远播放。
+    func pictureInPictureControllerIsPlaybackPaused(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) -> Bool {
+        return false
+    }
+
+    // 必需：用户点击 PiP 的播放/暂停按钮时调用。时钟始终播放，忽略暂停请求。
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        setPlaying playing: Bool
+    ) {
+        CrashLogger.shared.log("PiP setPlaying=\(playing)，忽略并保持播放")
+    }
+
+    // 可选：PiP 窗口尺寸变化
     func pictureInPictureController(
         _ pictureInPictureController: AVPictureInPictureController,
         didTransitionToRenderSize newRenderSize: CMVideoDimensions
@@ -302,38 +325,12 @@ extension ClockPIPManager: AVPictureInPictureSampleBufferPlaybackDelegate {
         CrashLogger.shared.log("PiP 尺寸变化: \(newRenderSize.width)x\(newRenderSize.height)")
     }
 
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        setPlaying playing: Bool
-    ) {
-        CrashLogger.shared.log("PiP setPlaying=\(playing)")
-    }
-
+    // 可选：用户拖动 PiP 进度条时调用。时钟没有进度，直接 completion。
     func pictureInPictureController(
         _ pictureInPictureController: AVPictureInPictureController,
         skipByInterval skipInterval: CMTime,
         completion: @escaping () -> Void
     ) {
         completion()
-    }
-
-    func pictureInPictureControllerShouldProcedeToPlayAfterApplyingBufferingHint(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> Bool {
-        return true
-    }
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        isPlaybackPaused: UnsafeMutablePointer<ObjCBool>
-    ) {
-        isPlaybackPaused.pointee = false
-    }
-
-    func pictureInPictureControllerTimeRangeForPlayback(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) -> CMTimeRange {
-        // 直播/无限流：从当前时间到正无穷
-        return CMTimeRange(start: CMTime.zero, end: CMTime.positiveInfinity)
     }
 }
