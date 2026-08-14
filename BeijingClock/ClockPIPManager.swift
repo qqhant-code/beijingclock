@@ -120,8 +120,16 @@ final class ClockPIPManager: NSObject {
     private func setupDisplayLayerAndPIP() {
         CrashLogger.shared.log("ClockPIPManager.setupDisplayLayerAndPIP 进入")
 
-        // 1) 准备一个 hidden host view，并把 sample buffer layer 挂上去。
-        //    sample buffer PiP 要求 layer 在 view hierarchy 中，否则 start 无回调。
+        // 0) 先确认系统是否支持 PiP
+        let supported = AVPictureInPictureController.isPictureInPictureSupported()
+        CrashLogger.shared.log("PiP isPictureInPictureSupported=\(supported)")
+        guard supported else {
+            CrashLogger.shared.log("设备/系统不支持 PiP，无法启动悬浮窗")
+            return
+        }
+
+        // 1) 准备一个**可见**的 host view（极小、几乎透明），把 sample buffer layer 挂上去。
+        //    sample buffer 模式的 PiP 要求 layer 实际在屏幕上渲染内容，hidden 状态不会触发任何回调。
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
               let keyWindow = scene.windows.first else {
             CrashLogger.shared.log("ClockPIPManager 找不到 keyWindow，无法启动 PiP")
@@ -130,17 +138,18 @@ final class ClockPIPManager: NSObject {
         let host = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
         host.backgroundColor = .clear
         host.isUserInteractionEnabled = false
-        host.isHidden = true
+        host.isHidden = false          // 必须可见，否则 PiP 认为没有内容在播放
+        host.alpha = 0.001             // 几乎全透明，用户看不到
         keyWindow.addSubview(host)
         self.hostView = host
 
         let layer = AVSampleBufferDisplayLayer()
-        layer.videoGravity = .resizeAspect
+        layer.videoGravity = .resizeAspectFill
         layer.frame = host.bounds
         host.layer.addSublayer(layer)
         self.sampleBufferDisplayLayer = layer
 
-        CrashLogger.shared.log("ClockPIPManager 已把 sampleBufferDisplayLayer 加入 view hierarchy")
+        CrashLogger.shared.log("ClockPIPManager 已把 sampleBufferDisplayLayer 加入 view hierarchy (host visible)")
 
         // 2) 创建 PiP controller
         let contentSource = AVPictureInPictureController.ContentSource(
@@ -158,7 +167,8 @@ final class ClockPIPManager: NSObject {
         // 3) 先喂一帧，再启动 PiP，给系统一个可渲染的内容
         renderFrame()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            CrashLogger.shared.log("ClockPIPManager 调用 startPictureInPicture")
+            let possible = controller.isPictureInPicturePossible
+            CrashLogger.shared.log("PiP isPictureInPicturePossible=\(possible)，调用 startPictureInPicture")
             controller.startPictureInPicture()
         }
     }
