@@ -11,19 +11,16 @@ import CoreGraphics
 /// 1) zk 跨 App 悬浮靠的是 AVPlayer + AVPlayerViewController + 系统 PiP。
 /// 2) iPhone 上裸 AVPictureInPictureController(playerLayer:) 的 isPictureInPicturePossible 永远 false，
 ///    只有经由 AVPlayerViewController 托管的 PiP 才被系统允许。
-/// 3) AVPlayerViewController 的 pictureInPictureController 是懒加载的，只有把 AVPlayerViewController
-///    present 出来、view 真正上屏后系统才会创建它（1x1 UIWindow 不够，必须 present）。
-/// 4) iPhone 上手动 startPictureInPicture() 必须在用户手势调用栈内，否则 possible 一直 false。
-///    解决：设置 canStartPictureInPictureAutomaticallyFromInline = true，present 后再 dismiss，
-///    系统会自动进入 PiP，且不要求手势。
-/// 5) 必须等 AVPlayerItem.status == .readyToPlay 后再 dismiss 触发自动 PiP。
+/// 3) AVPlayerViewController 的 pictureInPictureController 是懒加载的，present（animated）后 view 上屏才创建。
+///    必须用 KVC/responds 取出；若 present 用 animated:false，懒加载可能尚未发生，取不到。
+/// 4) zk 视频用 AVAssetExportSession 导出为 fast-start 标准 MP4（shouldOptimizeForNetworkUse），
+///    这样 isPictureInPicturePossible 才会变 true。裸 AVAssetWriter 默认 moov 在尾部（非 fast-start），
+///    PiP 资格检查会判定“不可 PiP”。
+/// 5) zk 直接 startPictureInPicture()（在用户点开浮窗的手势栈内）。我们也尽量在手势内 present，
+///    并在 item readyToPlay 后直接 startPictureInPicture()；同时保留 canStartPictureInPictureAutomaticallyFromInline
+///    + dismiss 作为手势缺失时的兜底（系统自动 PiP 不要求手势）。
 /// 6) GitHub Actions 构建机 SDK 较旧，没有 AVPlayerViewController.pictureInPictureController 成员，
-///    故用 Objective-C runtime performSelector 在运行时取出（仅用于日志/兜底）。
-///
-/// 实现：
-/// - 把“当前这一分钟”的北京时间渲染成 640x160 循环视频；
-/// - AVPlayerViewController present 后 dismiss，靠系统自动 PiP 得到悬浮小窗；
-/// - 每分钟交界重生成视频，保证时钟永远对齐北京时间。
+///    故用 Objective-C runtime（responds + perform / KVC）在运行时取出。
 final class ClockPIPManager: NSObject {
 
     static let shared = ClockPIPManager()
@@ -43,11 +40,12 @@ final class ClockPIPManager: NSObject {
     private var regenTimer: Timer?
     private var watchdogTimer: Timer?
 
-    /// present 是否已完成（viewDidAppear 后）。present 与 readyToPlay 都是异步，
-    /// 需要二者都就绪再 dismiss 触发自动 PiP。
+    /// present 是否已完成（viewDidAppear 后）。present 与 readyToPlay 都是异步。
     private var presentDone = false
-    /// readyToPlay 已就绪、等待 present 完成后立即 dismiss。
-    private var pendingDismiss = false
+    /// AVPlayerItem 是否已 readyToPlay。
+    private var itemReady = false
+    /// 是否已经尝试启动过 PiP（避免重复 start）。
+    private var triedStart = false
 
     private var offset: TimeInterval = 0
     private var running = false
@@ -87,9 +85,13 @@ final class ClockPIPManager: NSObject {
         running = true
         isRunning = true
         presentDone = false
-        pendingDismiss = false
+        itemReady = false
+        triedStart = false
 
         setupAudioSession()
+        // 在按钮手势栈内立即 present playerVC（animated:true 触发 lazy PiP controller 创建）
+        setupPlayerVC()
+        // 后台生成 fast-start 视频，完成后替换 player item
         buildVideoAndStart()
         startRegenTimer()
 
@@ -160,6 +162,75 @@ final class ClockPIPManager: NSObject {
         }
     }
 
+    // MARK: - present AVPlayerViewController（手势栈内，animated 触发 lazy controller）
+
+    private func setupPlayerVC() {
+        let player = AVPlayer()
+        player.isMuted = true
+        player.actionAtItemEnd = .none
+        self.player = player
+
+        let pvc = AVPlayerViewController()
+        pvc.player = player
+        pvc.showsPlaybackControls = false
+        pvc.allowsPictureInPicturePlayback = true
+        // 兜底：允许“离开内联时自动进入 PiP”，不要求手势
+        pvc.canStartPictureInPictureAutomaticallyFromInline = true
+        pvc.delegate = self
+        pvc.view.backgroundColor = .clear
+        self.playerVC = pvc
+
+        guard let root = Self.topViewController() else {
+            CrashLogger.shared.log("ClockPIPManager 找不到可呈现的 VC，无法启动 PiP")
+            return
+        }
+        pvc.modalPresentationStyle = .overFullScreen
+        root.present(pvc, animated: true) { [weak self] in
+            guard let self = self else { return }
+            self.presentDone = true
+            CrashLogger.shared.log("ClockPIPManager present 完成（viewDidAppear）")
+            self.retrieveControllerWithRetry(attempt: 0)
+            self.tryStartPiP()
+        }
+        CrashLogger.shared.log("ClockPIPManager 已 present AVPlayerViewController（手势栈内）")
+    }
+
+    /// 通过 Objective-C runtime 取出内部懒加载的 PiP controller（带重试）。
+    private func retrieveControllerWithRetry(attempt: Int) {
+        guard let pvc = playerVC else { return }
+        if let c = Self.obtainControllerOnce(from: pvc) {
+            pipController = c
+            CrashLogger.shared.log("ClockPIPManager 已拿到 PiPController (runtime, 尝试 \(attempt))")
+            tryStartPiP()
+            return
+        }
+        if attempt < 10 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self = self, self.running else { return }
+                self.retrieveControllerWithRetry(attempt: attempt + 1)
+            }
+        } else {
+            CrashLogger.shared.log("ClockPIPManager 10 次重试仍未拿到 PiPController（可能该设备/iOS 不支持）")
+        }
+    }
+
+    /// 单次尝试取出 pictureInPictureController（perform/KVC，统一在 responds 守卫内，避免 KVC 抛异常）。
+    private static func obtainControllerOnce(from pvc: AVPlayerViewController) -> AVPictureInPictureController? {
+        let sel = NSSelectorFromString("pictureInPictureController")
+        guard pvc.responds(to: sel) else { return nil }
+        // perform 取出
+        if let res = pvc.perform(sel) {
+            if let c = res.takeUnretainedValue() as? AVPictureInPictureController {
+                return c
+            }
+        }
+        // KVC 兜底（同样在 responds 守卫内，不会抛异常）
+        if let c = pvc.value(forKey: "pictureInPictureController") as? AVPictureInPictureController {
+            return c
+        }
+        return nil
+    }
+
     // MARK: - 生成“当前分钟”的时钟视频并启动
 
     private func buildVideoAndStart() {
@@ -176,7 +247,10 @@ final class ClockPIPManager: NSObject {
                         CrashLogger.shared.log("ClockPIPManager 生成视频失败，无法启动 PiP")
                         return
                     }
-                    self.setupPlayer(url: url, startAtSecond: currentSecond)
+                    let item = AVPlayerItem(url: url)
+                    self.player?.replaceCurrentItem(with: item)
+                    self.observeItemAndPlay(item: item, startAtSecond: currentSecond)
+                    CrashLogger.shared.log("ClockPIPManager 已设置 playerItem（fast-start 视频）")
                 }
             }
         }
@@ -210,79 +284,50 @@ final class ClockPIPManager: NSObject {
         }
     }
 
-    // MARK: - 用 AVPlayerViewController present + 自动 PiP
-
-    private func setupPlayer(url: URL, startAtSecond: Int) {
-        CrashLogger.shared.log("ClockPIPManager.setupPlayer 进入 startAtSecond=\(startAtSecond)")
-        let item = AVPlayerItem(url: url)
-        let player = AVPlayer(playerItem: item)
-        player.actionAtItemEnd = .none
-        player.isMuted = true
-        self.player = player
-
-        let pvc = AVPlayerViewController()
-        pvc.player = player
-        pvc.showsPlaybackControls = false
-        pvc.allowsPictureInPicturePlayback = true
-        // 关键：允许"离开内联时自动进入 PiP"，不要求用户手势直接调 startPictureInPicture
-        pvc.canStartPictureInPictureAutomaticallyFromInline = true
-        pvc.delegate = self
-        pvc.view.backgroundColor = .clear
-        self.playerVC = pvc
-
-        guard let root = Self.topViewController() else {
-            CrashLogger.shared.log("ClockPIPManager 找不到可呈现的 VC，无法启动 PiP")
-            return
-        }
-
-        // present 全屏（overFullScreen 透明），让 view 上屏触发 pictureInPictureController 懒加载。
-        // 一旦 PiP 自动接管，全屏会被系统接管而不遮挡 App。
-        pvc.modalPresentationStyle = .overFullScreen
-        root.present(pvc, animated: false) { [weak self] in
-            guard let self = self else { return }
-            self.presentDone = true
-            CrashLogger.shared.log("ClockPIPManager present 完成（viewDidAppear）")
-            // 用 runtime 取 controller（仅日志/兜底用）
-            self.pipController = Self.retrievePiPController(from: pvc)
-            CrashLogger.shared.log("ClockPIPManager picController 取到=\(self.pipController != nil)")
-            if self.pendingDismiss {
-                self.pendingDismiss = false
-                self.dismissForAutoPiP()
-            }
-        }
-
-        observeItemAndPlay(item: item, startAtSecond: startAtSecond)
-    }
-
-    /// 通过 Objective-C runtime 取出 AVPlayerViewController 内部懒加载的 PiP controller（仅日志/兜底）。
-    private static func retrievePiPController(from pvc: AVPlayerViewController) -> AVPictureInPictureController? {
-        let sel = NSSelectorFromString("pictureInPictureController")
-        guard pvc.responds(to: sel) else { return nil }
-        let result = pvc.perform(sel)
-        return result?.takeUnretainedValue() as? AVPictureInPictureController
-    }
-
     private func observeItemAndPlay(item: AVPlayerItem, startAtSecond: Int) {
         itemObserver?.invalidate()
+        itemReady = false
         itemObserver = item.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
             guard let self = self else { return }
             CrashLogger.shared.log("AVPlayerItem status=\(item.status.rawValue)")
             if item.status == .readyToPlay {
+                self.itemReady = true
                 let t = CMTime(value: Int64(startAtSecond), timescale: 1)
                 self.player?.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
                 self.player?.play()
-                CrashLogger.shared.log("AVPlayerItem readyToPlay，准备触发自动 PiP")
-                // present 完成且 ready 后，dismiss playerVC 触发系统自动进入 PiP
-                if self.presentDone {
-                    self.dismissForAutoPiP()
-                } else {
-                    self.pendingDismiss = true
-                }
-                self.startWatchdog()
+                CrashLogger.shared.log("AVPlayerItem readyToPlay，准备启动 PiP")
+                self.tryStartPiP()
             } else if item.status == .failed {
                 CrashLogger.shared.log("AVPlayerItem failed: \(item.error?.localizedDescription ?? "unknown")")
             }
         }
+    }
+
+    /// 尝试启动 PiP：需要 controller + presentDone + itemReady 三者就绪。
+    /// 优先直接 startPictureInPicture()（zk 同款，手势内直调）；
+    /// 若 isPictureInPicturePossible=false，则用 dismiss 触发系统自动 PiP（canStartPictureInPictureAutomaticallyFromInline）。
+    private func tryStartPiP() {
+        guard let controller = pipController, presentDone, itemReady else {
+            CrashLogger.shared.log("tryStartPiP 跳过：controller/present/item 未就绪 (controller=\(pipController != nil), present=\(presentDone), item=\(itemReady))")
+            return
+        }
+        guard !triedStart else { return }
+        triedStart = true
+
+        let possible = controller.isPictureInPicturePossible
+        CrashLogger.shared.log("PiP isPictureInPicturePossible=\(possible)")
+
+        if possible {
+            controller.startPictureInPicture()
+            CrashLogger.shared.log("PiP startPictureInPicture() 已调用（直接启动）")
+        } else if let pvc = playerVC, pvc.presentingViewController != nil {
+            // 兜底：dismiss 触发系统自动 PiP（不要求手势）
+            CrashLogger.shared.log("PiP possible=false，dismiss playerVC 触发系统自动 PiP")
+            pvc.dismiss(animated: false, completion: nil)
+        } else {
+            CrashLogger.shared.log("PiP possible=false 且 playerVC 未 present，无法触发")
+        }
+        startWatchdog()
     }
 
     /// 启动一个 watchdog：若 12s 内 PiP 仍未接管，则 dismiss 全屏恢复 App，避免卡在“启动中”。
@@ -300,16 +345,6 @@ final class ClockPIPManager: NSObject {
         }
     }
 
-    /// dismiss playerVC 触发系统自动进入 PiP（canStartPictureInPictureAutomaticallyFromInline=true）。
-    private func dismissForAutoPiP() {
-        guard let pvc = playerVC, pvc.presentingViewController != nil else {
-            CrashLogger.shared.log("dismissForAutoPiP 跳过：playerVC 未 present")
-            return
-        }
-        CrashLogger.shared.log("dismiss playerVC 触发系统自动 PiP（canStartPictureInPictureAutomaticallyFromInline）")
-        pvc.dismiss(animated: false, completion: nil)
-    }
-
     @objc private func itemDidPlayToEnd(_ notification: Notification) {
         // 手动循环
         player?.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
@@ -318,10 +353,10 @@ final class ClockPIPManager: NSObject {
     // MARK: - 生成时钟视频（在 genQueue 后台执行；UIKit 绘制仍回主线程，但等待的是后台线程，不会死锁）
 
     private func generateClockVideo(minuteStart: Date, completion: @escaping (URL?) -> Void) {
-        let url = Self.cachesVideoURL()
-        try? FileManager.default.removeItem(at: url)
+        let rawURL = Self.cachesVideoRawURL()
+        try? FileManager.default.removeItem(at: rawURL)
 
-        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mp4) else {
+        guard let writer = try? AVAssetWriter(outputURL: rawURL, fileType: .mp4) else {
             CrashLogger.shared.log("ClockPIPManager 创建 AVAssetWriter 失败")
             completion(nil)
             return
@@ -362,7 +397,6 @@ final class ClockPIPManager: NSObject {
             let frameDate = minuteStart.addingTimeInterval(TimeInterval(second))
             let text = TimeSync.formatBeijingPrecise(frameDate)
             // UIKit 绘制必须在主线程：把绘制排到主线程，当前（后台）线程等待信号。
-            // 注意：等待的是后台线程，主线程能正常执行绘制并 signal，不会死锁。
             var pb: CVPixelBuffer?
             let sem = DispatchSemaphore(value: 0)
             DispatchQueue.main.async {
@@ -383,11 +417,39 @@ final class ClockPIPManager: NSObject {
         input.markAsFinished()
         writer.finishWriting {
             if success && writer.status == .completed {
-                CrashLogger.shared.log("ClockPIPManager 视频生成完成: \(url.lastPathComponent)")
-                completion(url)
+                CrashLogger.shared.log("ClockPIPManager 原始视频生成完成: \(rawURL.lastPathComponent)")
+                // 用 AVAssetExportSession 重新导出为 fast-start 标准 MP4（对齐 zk，提升 PiP 兼容性）
+                Self.exportFastStart(source: rawURL) { finalURL in
+                    CrashLogger.shared.log("ClockPIPManager 视频导出完成: \(finalURL?.lastPathComponent ?? "nil")")
+                    completion(finalURL)
+                }
             } else {
                 CrashLogger.shared.log("ClockPIPManager 视频生成失败 status=\(writer.status.rawValue)")
                 completion(nil)
+            }
+        }
+    }
+
+    /// 把 AVAssetWriter 产物用 AVAssetExportSession 重新导出为 fast-start MP4（moov 前置），
+    /// 这是 PiP 资格检查能认可的关键（zk 也用 AVAssetExportSession）。
+    private static func exportFastStart(source: URL, completion: @escaping (URL?) -> Void) {
+        let asset = AVAsset(url: source)
+        guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+            CrashLogger.shared.log("ClockPIPManager 创建 AVAssetExportSession 失败，使用原始文件")
+            completion(source)
+            return
+        }
+        let finalURL = Self.cachesVideoURL()
+        try? FileManager.default.removeItem(at: finalURL)
+        session.outputURL = finalURL
+        session.outputFileType = .mp4
+        session.shouldOptimizeForNetworkUse = true
+        session.exportAsynchronously {
+            if session.status == .completed {
+                completion(finalURL)
+            } else {
+                CrashLogger.shared.log("ClockPIPManager 导出失败 status=\(session.status.rawValue)，回退原始文件")
+                completion(source)
             }
         }
     }
@@ -459,8 +521,7 @@ final class ClockPIPManager: NSObject {
             CrashLogger.shared.log("ClockPIPManager 创建 CGContext 失败")
             return nil
         }
-        // 注意：不要在这里做 Y 轴翻转。UIKit 生成的 UIImage 与 CVPixelBuffer 的内存行序
-        // 直接 draw 即可得到正向视频；之前的 translate+scale 会导致播放时上下镜像。
+        // 不要做 Y 轴翻转，否则播放时上下镜像。
         context.draw(image.cgImage!, in: CGRect(origin: .zero, size: size))
         return pixelBuffer
     }
@@ -496,6 +557,11 @@ final class ClockPIPManager: NSObject {
         return vc
     }
 
+    static func cachesVideoRawURL() -> URL {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        return dir.appendingPathComponent("clock_raw.mp4")
+    }
+
     static func cachesVideoURL() -> URL {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         return dir.appendingPathComponent("clock_loop.mp4")
@@ -516,6 +582,7 @@ extension ClockPIPManager: AVPictureInPictureControllerDelegate {
         _ pictureInPictureController: AVPictureInPictureController
     ) {
         isPictureInPictureActive = true
+        triedStart = true
         CrashLogger.shared.log("PiP 已开始显示（系统浮窗接管）")
         watchdogTimer?.invalidate(); watchdogTimer = nil
         // PiP 已接管播放，playerVC 此时应已被系统 dismiss，确保清理引用
