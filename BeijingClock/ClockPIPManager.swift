@@ -128,7 +128,7 @@ final class ClockPIPManager: NSObject {
         CrashLogger.shared.log("ClockPIPManager 已创建 PiPController")
 
         // 立即启动 PiP；若系统需要缓冲一帧，renderFrame 会在 displayLink 触发后立刻喂帧。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             CrashLogger.shared.log("ClockPIPManager 调用 startPictureInPicture")
             controller.startPictureInPicture()
         }
@@ -163,9 +163,7 @@ final class ClockPIPManager: NSObject {
         // 1) 用 UIGraphicsImageRenderer 在 UIImage 里绘制时钟（UIKit 坐标系，无需手动翻转）
         let size = CGSize(width: width, height: height)
         let renderer = UIGraphicsImageRenderer(size: size)
-        let image = renderer.image { ctx in
-            let c = ctx.cgContext
-
+        let image = renderer.image { _ in
             // 背景：深灰半透明圆角条
             let barRect = CGRect(origin: .zero, size: size)
             let path = UIBezierPath(roundedRect: barRect, cornerRadius: 22)
@@ -314,9 +312,9 @@ extension ClockPIPManager: AVPictureInPictureSampleBufferPlaybackDelegate {
     func pictureInPictureController(
         _ pictureInPictureController: AVPictureInPictureController,
         skipByInterval skipInterval: CMTime,
-        completionHandler: @escaping () -> Void
+        completion: @escaping () -> Void
     ) {
-        completionHandler()
+        completion()
     }
 
     func pictureInPictureControllerShouldProcedeToPlayAfterApplyingBufferingHint(

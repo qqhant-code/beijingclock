@@ -155,20 +155,15 @@ struct ContentView: View {
         .onAppear {
             crashText = CrashLogger.shared.lastCrash()
             resync()
-            startRefreshTimer()
         }
         .onReceive(NotificationCenter.default.publisher(for: FloatingClockManager.pipStateNotification)) { _ in
             refreshTick += 1
         }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            refreshTick += 1
+        }
         .onChange(of: refreshTick) { _ in
             lastError = FloatingClockManager.shared.lastError
-        }
-    }
-
-    /// 每秒主动刷新一次 UI，防止通知漏发导致按钮状态与实际不一致。
-    private func startRefreshTimer() {
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.refreshTick += 1
         }
     }
 
