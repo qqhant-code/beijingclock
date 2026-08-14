@@ -280,7 +280,7 @@ final class ClockPIPManager: NSObject {
                 return
             }
             let possible = controller.isPictureInPicturePossible
-            let supported = controller.isPictureInPictureSupported
+            let supported = AVPictureInPictureController.isPictureInPictureSupported
             CrashLogger.shared.log("PiP 轮询 isPictureInPicturePossible=\(possible) supported=\(supported) elapsed=\(String(format: "%.1f", elapsed))s")
             if possible {
                 timer.invalidate(); self.pollingTimer = nil
