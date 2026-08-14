@@ -68,27 +68,27 @@ final class FloatingClockWindow: UIWindow {
             clockBar.heightAnchor.constraint(equalToConstant: FloatingClockWindow.barHeight)
         ])
 
-        // 时间文本（等宽字体，秒级跳动不抖动）
+        // 先把两个子视图都加进时钟条，再统一激活约束。
+        // 否则互相引用的约束（timeLabel.trailing == closeButton.leading）会因为
+        // 对方此时还没有 superview 而报「no common ancestor」崩溃。
         timeLabel.text = "--:--:--.-"
         timeLabel.textColor = .white
         timeLabel.font = UIFont.monospacedSystemFont(ofSize: 30, weight: .semibold)
         timeLabel.textAlignment = .center
         clockBar.addSubview(timeLabel)
         timeLabel.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            timeLabel.leadingAnchor.constraint(equalTo: clockBar.leadingAnchor, constant: 14),
-            timeLabel.centerYAnchor.constraint(equalTo: clockBar.centerYAnchor),
-            timeLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6)
-        ])
 
-        // 关闭按钮：点击停止悬浮
         closeButton.setTitle("✕", for: .normal)
         closeButton.setTitleColor(.lightGray, for: .normal)
         closeButton.titleLabel?.font = UIFont.systemFont(ofSize: 20, weight: .medium)
         closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
         clockBar.addSubview(closeButton)
         closeButton.translatesAutoresizingMaskIntoConstraints = false
+
         NSLayoutConstraint.activate([
+            timeLabel.leadingAnchor.constraint(equalTo: clockBar.leadingAnchor, constant: 14),
+            timeLabel.centerYAnchor.constraint(equalTo: clockBar.centerYAnchor),
+            timeLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6),
             closeButton.trailingAnchor.constraint(equalTo: clockBar.trailingAnchor, constant: -10),
             closeButton.centerYAnchor.constraint(equalTo: clockBar.centerYAnchor),
             closeButton.widthAnchor.constraint(equalToConstant: 30),
