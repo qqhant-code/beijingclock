@@ -53,11 +53,8 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
             return
         }
 
-        CrashLogger.shared.log("start() 调用 startSilentAudio 前")
-        startSilentAudio()
-        CrashLogger.shared.log("start() startSilentAudio 返回")
-
-        // 取当前活跃的 UIWindowScene 来创建悬浮窗
+        // 1) 先创建并显示悬浮窗（与音频保活解耦，便于定位崩溃来源）
+        CrashLogger.shared.log("start() 取 foregroundActive scene")
         guard let scene = UIApplication.shared.connectedScenes
                 .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else {
             CrashLogger.shared.log("start() 未获取到 foregroundActive scene，0.5s 后重试")
@@ -69,9 +66,9 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
             return
         }
 
-        CrashLogger.shared.log("start() 获取到 scene，准备创建 FloatingClockWindow")
+        CrashLogger.shared.log("start() 创建 FloatingClockWindow")
         let win = FloatingClockWindow(scene: scene)
-        CrashLogger.shared.log("start() FloatingClockWindow 创建成功")
+        CrashLogger.shared.log("start() FloatingClockWindow 创建成功，showFloating")
         win.showFloating()
         FloatingClockWindow.shared = win
         floating = true
@@ -81,7 +78,13 @@ final class FloatingClockManager: NSObject, CLLocationManagerDelegate {
 
         updateTime()
         startPump()
-        CrashLogger.shared.log("start() 完成，悬浮窗已显示")
+        CrashLogger.shared.log("start() 悬浮窗已显示，准备延迟启动音频")
+
+        // 2) 静音音频保活延迟 0.4s 启动（若此处崩溃，说明问题在音频而非窗口）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            CrashLogger.shared.log("start() 延迟启动 startSilentAudio")
+            self?.startSilentAudio()
+        }
 
         // 每 5 分钟重新校时一次
         resyncTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in

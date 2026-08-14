@@ -8,6 +8,12 @@ targets:
   BeijingClock:
     type: application
     platform: iOS
+    settings:
+      base:
+        # 保留符号表，便于崩溃日志 dladdr 解析出函数名（诊断用，IPA 仅略增大）
+        STRIP_STYLE: non-global
+        STRIP_SWIFT_SYMBOLS: "NO"
+        COPY_PHASE_STRIP: "NO"
     sources:
       - path: BeijingClock
         excludes:

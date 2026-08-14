@@ -1,7 +1,15 @@
 import Foundation
+import Darwin
 
 /// 轻量崩溃/运行日志：闪退时把异常与调用栈写入沙盒文件，
 /// 下次启动由 App 界面直接展示，相当于"iOS 版 logcat + 崩溃报告"。
+///
+/// 关键修复：
+/// - NSException 会先被 exceptionHandler 抓住并写入"异常报告"，
+///   随后系统 abort() 又触发 SIGABRT；信号处理器发现"异常报告已存在"
+///   就**不再覆盖**，保留最有价值的堆栈。
+/// - 用 dladdr 把地址符号化成 函数名+偏移，配合构建时保留符号表，
+///   能直接看到是哪个 Swift 函数崩溃。
 final class CrashLogger {
 
     static let shared = CrashLogger()
@@ -17,6 +25,9 @@ final class CrashLogger {
     }()
 
     private let q = DispatchQueue(label: "crashlogger")
+
+    /// 标记：NSException 已写入报告，信号处理器据此避免覆盖。
+    private static var exceptionReported = false
 
     // MARK: - 安装
 
@@ -45,7 +56,7 @@ final class CrashLogger {
     }
 
     func lastLog() -> String? {
-        guard let url = logURL, (try? String(contentsOf: url)) != nil else { return nil }
+        guard let url = logURL else { return nil }
         return try? String(contentsOf: url, encoding: .utf8)
     }
 
@@ -67,41 +78,62 @@ final class CrashLogger {
         try? text.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    fileprivate static func captureBacktrace() -> String {
-        var frames = [UnsafeMutableRawPointer?](repeating: nil, count: 64)
-        let count = Darwin.backtrace(&frames, Int32(frames.count))
-        guard let syms = backtrace_symbols(&frames, count) else { return "(无符号)" }
-        defer { free(syms) }
-        var out = ""
-        for i in 0..<Int(count) {
-            if let c = syms[i] { out += String(cString: c) + "\n" }
-        }
-        return out
-    }
-
     fileprivate static func ts() -> String {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
         return f.string(from: Date())
+    }
+
+    /// 把一组返回地址符号化成「序号 镜像 函数名 + 偏移」，便于定位。
+    fileprivate static func symbolicate(_ addresses: [NSNumber]) -> String {
+        var out = ""
+        for (i, addr) in addresses.enumerated() {
+            let v = addr.uintValue
+            guard let ptr = UnsafeRawPointer(bitPattern: v) else {
+                out += String(format: "%-3d 0x%lx\n", i, v)
+                continue
+            }
+            var info = Dl_info()
+            if dladdr(ptr, &info) != 0 {
+                let fname = info.dli_fname.map { String(cString: $0) } ?? "?"
+                let sname = info.dli_sname.map { String(cString: $0) } ?? "?"
+                let base = UInt(bitPattern: info.dli_fbase)
+                let off = v - base
+                let short = (fname as NSString).lastPathComponent
+                out += String(format: "%-3d %@  %@ + 0x%x\n", i, short, sname, off)
+            } else {
+                out += String(format: "%-3d 0x%lx\n", i, v)
+            }
+        }
+        return out
     }
 }
 
 // MARK: - 文件级崩溃处理器（非捕获函数，才能转 C 函数指针）
 
 private func exceptionHandler(_ exc: NSException) {
-    let stack = (exc.callStackSymbols as [String]).joined(separator: "\n")
+    // 用返回地址符号化，能直接看到崩溃所在的 Swift 函数
+    let stack = CrashLogger.symbolicate(exc.callStackReturnAddresses)
     let text = """
     === UNCAUGHT EXCEPTION @ \(CrashLogger.ts()) ===
     Name : \(exc.name)
     Reason: \(exc.reason ?? "(无)")
     Thread: \(Thread.isMainThread ? "main" : "background")
-    Call stack:
+    Symbolicated call stack:
     \(stack)
     """
+    CrashLogger.exceptionReported = true
     CrashLogger.shared.writeCrash(text)
+    // 不在此 re-raise：系统会在 exceptionHandler 返回后自动 abort()
 }
 
 private func bcSignalHandler(_ sig: Int32) {
+    // 若 NSException 已写过报告，保留它，不要再覆盖成信号处理器自己的栈
+    if CrashLogger.exceptionReported {
+        signal(sig, SIG_DFL)
+        kill(getpid(), sig)
+        return
+    }
     let name: String
     switch sig {
     case SIGABRT: name = "SIGABRT"
@@ -112,7 +144,13 @@ private func bcSignalHandler(_ sig: Int32) {
     case SIGFPE:  name = "SIGFPE"
     default:      name = "signal \(sig)"
     }
-    let text = "=== \(name) @ \(CrashLogger.ts()) ===\n\(CrashLogger.captureBacktrace())\n"
+    // 当前线程栈（含信号处理器自身），只能作为补充参考
+    let stack = CrashLogger.symbolicate(Thread.callStackReturnAddresses)
+    let text = """
+    === \(name) @ \(CrashLogger.ts()) ===
+    (注：此栈含信号处理器自身，真正的崩溃点请看 UNCAUGHT EXCEPTION 报告)
+    \(stack)
+    """
     CrashLogger.shared.writeCrash(text)
     signal(sig, SIG_DFL)
     kill(getpid(), sig)
