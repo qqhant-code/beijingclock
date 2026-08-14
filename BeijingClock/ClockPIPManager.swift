@@ -2,7 +2,7 @@ import UIKit
 import AVKit
 import AVFoundation
 import CoreVideo
-import CoreImage
+import CoreMedia
 import CoreGraphics
 
 /// 画中画悬浮时钟管理器。
@@ -20,6 +20,10 @@ final class ClockPIPManager: NSObject {
     private var displayLink: CADisplayLink?
     private var offset: TimeInterval = 0
     private var running = false
+
+    /// sample buffer 模式的 PiP 要求 layer 必须在一个可见的 view hierarchy 里，
+    /// 否则 startPictureInPicture() 不会调用任何 delegate。这里用一个 1x1 的隐藏宿主 view。
+    private var hostView: UIView?
 
     /// 视频帧尺寸：细长条，类似 zk 助手顶部条。
     /// 宽度 > 高度，PiP 窗口会呈现为横向条。
@@ -69,7 +73,10 @@ final class ClockPIPManager: NSObject {
 
         pipController?.stopPictureInPicture()
         pipController = nil
+        sampleBufferDisplayLayer?.removeFromSuperlayer()
         sampleBufferDisplayLayer = nil
+        hostView?.removeFromSuperview()
+        hostView = nil
 
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         CrashLogger.shared.log("ClockPIPManager.stop 完成")
@@ -112,23 +119,45 @@ final class ClockPIPManager: NSObject {
 
     private func setupDisplayLayerAndPIP() {
         CrashLogger.shared.log("ClockPIPManager.setupDisplayLayerAndPIP 进入")
+
+        // 1) 准备一个 hidden host view，并把 sample buffer layer 挂上去。
+        //    sample buffer PiP 要求 layer 在 view hierarchy 中，否则 start 无回调。
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let keyWindow = scene.windows.first else {
+            CrashLogger.shared.log("ClockPIPManager 找不到 keyWindow，无法启动 PiP")
+            return
+        }
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        host.backgroundColor = .clear
+        host.isUserInteractionEnabled = false
+        host.isHidden = true
+        keyWindow.addSubview(host)
+        self.hostView = host
+
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = .resizeAspect
+        layer.frame = host.bounds
+        host.layer.addSublayer(layer)
         self.sampleBufferDisplayLayer = layer
 
+        CrashLogger.shared.log("ClockPIPManager 已把 sampleBufferDisplayLayer 加入 view hierarchy")
+
+        // 2) 创建 PiP controller
         let contentSource = AVPictureInPictureController.ContentSource(
             sampleBufferDisplayLayer: layer,
             playbackDelegate: self
         )
         let controller = AVPictureInPictureController(contentSource: contentSource)
         controller.delegate = self
-        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        // 我们是手动 start，不需要 inline 自动进入
+        controller.canStartPictureInPictureAutomaticallyFromInline = false
         self.pipController = controller
 
         CrashLogger.shared.log("ClockPIPManager 已创建 PiPController")
 
-        // 立即启动 PiP；若系统需要缓冲一帧，renderFrame 会在 displayLink 触发后立刻喂帧。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        // 3) 先喂一帧，再启动 PiP，给系统一个可渲染的内容
+        renderFrame()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             CrashLogger.shared.log("ClockPIPManager 调用 startPictureInPicture")
             controller.startPictureInPicture()
         }
@@ -138,7 +167,6 @@ final class ClockPIPManager: NSObject {
 
     private func startRendering() {
         CrashLogger.shared.log("ClockPIPManager.startRendering 进入")
-        renderFrame() // 先喂一帧，让 PiP 窗口能立即出现
         displayLink = CADisplayLink(target: self, selector: #selector(renderFrame))
         displayLink?.preferredFramesPerSecond = 15 // 15fps 足够让秒级时钟流畅跳动
         displayLink?.add(to: .main, forMode: .common)
@@ -162,7 +190,10 @@ final class ClockPIPManager: NSObject {
 
         // 1) 用 UIGraphicsImageRenderer 在 UIImage 里绘制时钟（UIKit 坐标系，无需手动翻转）
         let size = CGSize(width: width, height: height)
-        let renderer = UIGraphicsImageRenderer(size: size)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
         let image = renderer.image { _ in
             // 背景：深灰半透明圆角条
             let barRect = CGRect(origin: .zero, size: size)
@@ -189,7 +220,7 @@ final class ClockPIPManager: NSObject {
             attributed.draw(in: textRect)
         }
 
-        // 2) 创建 CVPixelBuffer (BGRA，AVSampleBufferDisplayLayer 原生支持)
+        // 2) 创建 CVPixelBuffer (ARGB，与 CGContext 默认 bitmap 匹配)
         let pixelAttrs: [String: Any] = [
             kCVPixelBufferCGImageCompatibilityKey as String: true,
             kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
@@ -199,7 +230,7 @@ final class ClockPIPManager: NSObject {
             kCFAllocatorDefault,
             width,
             height,
-            kCVPixelFormatType_32BGRA,
+            kCVPixelFormatType_32ARGB,
             pixelAttrs as CFDictionary,
             &pixelBuffer
         )
@@ -212,8 +243,7 @@ final class ClockPIPManager: NSObject {
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
 
-        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
-                     | CGBitmapInfo.byteOrder32Little.rawValue
+        let bitmapInfo = CGImageAlphaInfo.noneSkipFirst.rawValue
         guard let context = CGContext(
             data: CVPixelBufferGetBaseAddress(pixelBuffer),
             width: width,
@@ -288,6 +318,12 @@ extension ClockPIPManager: AVPictureInPictureControllerDelegate {
         isPictureInPictureActive = false
         CrashLogger.shared.log("PiP 启动失败: \(error)")
         FloatingClockManager.shared.pipStateDidChange()
+    }
+
+    func pictureInPictureControllerWillStart(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        CrashLogger.shared.log("PiP willStart")
     }
 }
 
