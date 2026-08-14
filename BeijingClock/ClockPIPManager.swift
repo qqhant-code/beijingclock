@@ -487,13 +487,12 @@ final class ClockPIPManager: NSObject {
     ) -> CMSampleBuffer? {
         let bytesPerSample = bitsPerChannel / 8
         let bytesPerFrame = bytesPerSample * channels
-        let bytesPerPacket = bytesPerFrame
 
         var asbd = AudioStreamBasicDescription(
             mSampleRate: sampleRate,
             mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
-            mBytesPerPacket: bytesPerPacket,
+            mBytesPerPacket: bytesPerFrame,
             mFramesPerPacket: 1,
             mBytesPerFrame: bytesPerFrame,
             mChannelsPerFrame: channels,
@@ -517,19 +516,35 @@ final class ClockPIPManager: NSObject {
         let dataSize = Int(numSamples) * Int(bytesPerFrame)
         let zeros = [UInt8](repeating: 0, count: dataSize)
 
+        // 用 Data 保留字节，并让 block buffer 自己 copy/管理内存（blockAllocator = default）。
         var blockBuffer: CMBlockBuffer?
-        let bbStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: UnsafeMutableRawPointer(mutating: zeros),
-            blockLength: dataSize,
-            blockAllocator: kCFAllocatorNull,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: dataSize,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
+        var bbStatus: OSStatus = noErr
+        zeros.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else {
+                bbStatus = OSStatus(kCMBlockBufferStructureAllocationFailedError)
+                return
+            }
+            var bb: CMBlockBuffer?
+            bbStatus = CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault,
+                memoryBlock: UnsafeMutableRawPointer(mutating: baseAddress),
+                blockLength: dataSize,
+                blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil,
+                offsetToData: 0,
+                dataLength: dataSize,
+                flags: 0,
+                blockBufferOut: &bb
+            )
+            blockBuffer = bb
+        }
         guard bbStatus == noErr, let blockBuffer = blockBuffer else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: numSamples, timescale: CMTimeScale(sampleRate)),
+            presentationTimeStamp: presentationTime,
+            decodeTimeStamp: CMTime.invalid
+        )
 
         var sampleBuffer: CMSampleBuffer?
         let sbStatus = CMSampleBufferCreate(
@@ -540,9 +555,8 @@ final class ClockPIPManager: NSObject {
             refcon: nil,
             formatDescription: formatDesc,
             sampleCount: numSamples,
-            presentationTimeStamp: presentationTime,
-            sampleTimingEntryCount: 0,
-            sampleTimingArray: nil,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
             sampleSizeEntryCount: 0,
             sampleSizeArray: nil,
             sampleBufferOut: &sampleBuffer
