@@ -214,7 +214,10 @@ final class ClockPIPManager: NSObject {
             CrashLogger.shared.log("ClockPIPManager.setupPlayer 失败：playerLayer 为空")
             return
         }
-        let controller = AVPictureInPictureController(playerLayer: playerLayer)
+        guard let controller = AVPictureInPictureController(playerLayer: playerLayer) else {
+            CrashLogger.shared.log("ClockPIPManager 创建 PiPController 失败（playerLayer 无效）")
+            return
+        }
         controller.delegate = self
         controller.canStartPictureInPictureAutomaticallyFromInline = false
         self.pipController = controller
